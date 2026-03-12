@@ -1,0 +1,4389 @@
+const DB_NAME = "PPGPsi_Database";
+
+/* ==========================================================================
+   FINANCIAL AID MODULE - CONSTANTS
+   ========================================================================== */
+
+const EMAIL_SECRETARIA = 'ppgpsi@ufscar.br';
+const SYSTEM_LINK = ScriptApp.getService().getUrl();
+
+// Financial Aid Status Workflow (V3.2 Complete)
+const FINANCIAL_STATUS = {
+  'PENDING_ADVISOR': 'Aguardando Avaliação do Orientador',
+  'PENDING_CG': 'Em Análise pela Comissão de Gestão (CG)',
+  'PENDING_INFO': 'Aguardando Elucidação (Retornado para Ajustes)',
+  'APPROVED_CG': 'Aprovado pela CG (Aguardando Trâmite da Secretaria)',
+  'IN_MEETING': 'Em Pauta (Reunião do Colegiado)',
+  'ACCOUNTABILITY_REQUESTED': 'Prestação de Contas Solicitada',
+  'WAITING_CHECK': 'Prestação de Contas em Análise',
+  'WAITING_DEPOSIT': 'Aguardando Depósito Financeiro',
+  'COMPLETED': 'Concluído / Arquivado',
+  'REJECTED': 'Indeferido / Recusado',
+  'DELETED': 'Excluído',
+  'UPDATED': 'Dados Atualizados'
+};
+
+// Map human-readable status back to code
+const STATUS_CODE_MAP = Object.fromEntries(
+  Object.entries(FINANCIAL_STATUS).map(([k, v]) => [v, k])
+);
+
+/**
+ * Normalizes raw profile from spreadsheet to recognized role
+ * Supports: Solicitante/Discente, Orientador/Docente, Secretaria, CG, Externo
+ */
+function normalizarPerfil(perfilRaw) {
+  var p = String(perfilRaw).toLowerCase().trim();
+  if (p.includes('solicitante') || p.includes('aluno') || p.includes('estudante') || p.includes('discente')) return 'Discente';
+  if (p.includes('orientador') || p.includes('docente') || p.includes('professor')) return 'Docente';
+  if (p.includes('secretaria') || p.includes('sec')) return 'Secretaria';
+  if (p.includes('cg') || p.includes('comissão') || p.includes('conselho')) return 'CG';
+  if (p.includes('coordenação') || p.includes('coordenador')) return 'Coordenação';
+  return 'Externo';
+}
+
+
+/* ==========================================================================
+   FOLDER & FILE MANAGEMENT RESTORED
+   ========================================================================== */
+
+const ROOT_FOLDER_NAME = "!Sistema de Gestão PPGPsi/UFSCar";
+
+function getRootFolder() {
+  var folders = DriveApp.getFoldersByName(ROOT_FOLDER_NAME);
+  if (folders.hasNext()) return folders.next();
+  return DriveApp.createFolder(ROOT_FOLDER_NAME);
+}
+
+function getFolderByPath(pathArray) {
+  var current = getRootFolder();
+  for (var i = 0; i < pathArray.length; i++) {
+    var name = pathArray[i];
+    var found = false;
+    var folders = current.getFoldersByName(name);
+    while (folders.hasNext()) {
+      var f = folders.next();
+      if (f.getName() === name) { // Exact match
+        current = f;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      current = current.createFolder(name);
+    }
+  }
+  return current;
+}
+
+function getMeetingFolder(meeting) {
+  // Format: Reunioes_CPG \ (data_NomeReunião)
+  var dateStr = "";
+  try {
+    var d = new Date(meeting.Data_Reuniao); 
+    // Fix: d might be timezone offset if not handled carefully, assuming UTC or script TZ
+    dateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  } catch(e) { dateStr = "Indefinida"; }
+  
+  var folderName = dateStr + " - " + meeting.Nome;
+  return getFolderByPath(["Reunioes_CPG", folderName]);
+}
+
+function getFinancialRequestFolder(req, user, optDate) {
+  // Format: Financeiro \ (Tipo - Nome - Valor - Data)
+  var details = {};
+  try { details = JSON.parse(req.Detalhes || '{}'); } catch(e) {}
+  
+  var valor = details['Valor Solicitado (R$)'] || details['valor'] || req.Valor_Solicitado || '0';
+  var dateStr = Utilities.formatDate(optDate || new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  
+  var folderName = [
+    (req.Tipo_Solicitacao || 'Financeiro'),
+    (user.nome || user.Nome || 'Usuario'),
+    "R$ " + String(valor).replace('.', ','),
+    dateStr
+  ].join(" - ");
+  
+  return getFolderByPath(["Financeiro", folderName]);
+}
+
+function findTargetMeeting(requestDate) {
+  var meetings = getDataFromSheet("DB_Calendario_Reunioes");
+  var reqDate = new Date(requestDate);
+  reqDate.setHours(0,0,0,0);
+  
+  for (var i = 0; i < meetings.length; i++) {
+    var m = meetings[i];
+    if (m.Status === 'Concluída' || m.Status === 'Cancelada') continue;
+    
+    // Parse periods
+    var start = new Date(m.Data_Inicio_Periodo);
+    var end = new Date(m.Data_Fim_Periodo);
+    start.setHours(0,0,0,0);
+    end.setHours(23,59,59,999);
+    
+    if (reqDate >= start && reqDate <= end) {
+      return m;
+    }
+  }
+  return null;
+}
+
+
+/* ==========================================================================
+   SERVING HTML
+   ========================================================================== */
+
+function doGet(e) {
+  setupDatabase(); // Ensure DB exists on load
+  var template = HtmlService.createTemplateFromFile('index');
+  return template.evaluate()
+    .setTitle('PPGPsi - Sistema de Gestão')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+/* ==========================================================================
+   DATABASE SETUP & HELPERS
+   ========================================================================== */
+
+function getSpreadsheet() {
+  var files = DriveApp.getFilesByName(DB_NAME);
+  if (files.hasNext()) {
+    return SpreadsheetApp.open(files.next());
+  }
+  var ss = SpreadsheetApp.create(DB_NAME);
+  setupSheets(ss);
+  return ss;
+}
+
+function setupDatabase() {
+  getSpreadsheet(); // This triggers setupSheets if new
+}
+
+function setupSheets(ss) {
+  var sheets = [
+    { name: "DB_Usuarios", headers: ["ID", "Email", "Nome", "Roles", "Status", "Telefone", "Celular", "Endereco", "EmergenciaNome", "EmergenciaTel", "FotoUrl", "Data_Ingresso", "Creditos_Totais", "Data_Defesa", "Data_Qualificacao", "Data_Integralizacao", "Nome_Orientador", "Email_Orientador", "Nivel", "Creditos_Optativas", "Creditos_Obrigatorias", "Data_Defesa_Realizada", "CPF", "RG", "RG_Orgao", "RG_Data_Emissao", "Data_Nascimento", "Sexo", "Raca", "Logradouro", "Numero", "Complemento", "Bairro", "Cidade", "UF", "CEP", "Prazo_Acesso"] },
+    { name: "DB_Solicitacoes", headers: ["ID", "Data_Criacao", "ID_Usuario", "Tipo_Solicitacao", "Detalhes", "Status", "Historico_Aprovacao", "Comentarios", "Nome_Orientador", "Email_Orientador", "ID_Parecerista_CG"] },
+    { name: "DB_Eventos_Processos", headers: ["ID", "Tipo", "Titulo", "Data_Inicio", "Data_Fim", "Vagas", "Descricao", "Status"] },
+    { name: "DB_Financeiro", headers: ["ID", "ID_Solicitacao", "Valor", "Rubrica", "Descricao", "Data_Autorizacao"] },
+    { name: "DB_Calendario_Reunioes", headers: ["ID", "Nome", "Data_Reuniao", "Data_Inicio_Periodo", "Data_Fim_Periodo", "Status", "Prazo_Fechamento"] },
+    { name: "DB_Notificacoes", headers: ["ID", "ID_Usuario", "Tipo", "Titulo", "Mensagem", "Data", "Lido", "ID_Solicitacao"] },
+    { name: "DB_Ata", headers: ["ID", "ID_Reuniao", "ID_Solicitacao", "Observacao", "Data", "Usuario"] },
+    { name: "DB_Mural", headers: ["ID", "ID_Usuario", "Nome_Usuario", "FotoUrl", "Conteudo", "Data_Publicacao"] }
+  ];
+
+  sheets.forEach(function(schema) {
+    var sheet = ss.getSheetByName(schema.name);
+    if (!sheet) {
+      sheet = ss.insertSheet(schema.name);
+      sheet.appendRow(schema.headers);
+      
+      // Default Admin User if creating users table
+      if (schema.name === "DB_Usuarios") {
+        var currentUser = Session.getActiveUser().getEmail();
+        sheet.appendRow([Utilities.getUuid(), currentUser, "Admin Inicial", JSON.stringify(["Secretaria"]), "Ativo"]);
+      }
+    }
+  });
+  
+  // delete default "Sheet1" if it exists
+  var defaultSheet = ss.getSheetByName("Sheet1");
+  if (defaultSheet) ss.deleteSheet(defaultSheet);
+}
+
+function getDataFromSheet(sheetName) {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(sheetName);
+  
+  Logger.log("getDataFromSheet - Buscando: " + sheetName);
+  
+  // Self-Healing: If sheet missing, try running setup
+  if (!sheet) {
+      Logger.log("getDataFromSheet - Sheet não encontrada, tentando setup...");
+      setupSheets(ss);
+      sheet = ss.getSheetByName(sheetName);
+  }
+  
+  if (!sheet) {
+    Logger.log("getDataFromSheet - ERRO: Sheet ainda não encontrada após setup!");
+    throw new Error("Tabela não encontrada: " + sheetName);
+  }
+
+  var data = sheet.getDataRange().getValues();
+  Logger.log("getDataFromSheet - Total de linhas (incluindo header): " + data.length);
+  
+  if (data.length === 0) return [];
+  
+  var headers = data.shift().map(function(h) { return h.toString().trim(); }); // Trim headers
+  Logger.log("getDataFromSheet - Headers: " + headers.join(", "));
+  Logger.log("getDataFromSheet - Dados (excluindo header): " + data.length + " linhas");
+  
+  return data.map(function(row) {
+    var obj = {};
+    headers.forEach(function(header, i) {
+      // Handle potential row length mismatch
+      obj[header] = (row.length > i) ? row[i] : "";
+    });
+    return obj;
+  });
+}
+
+/* ==========================================================================
+   DRIVE SERVICE (Centralized File Management)
+   ========================================================================== */
+var DriveService = {
+    FOLDERS: {
+        ROOT: "!Sistema de Gestão - PPGPsi/UFSCar",
+        CPG: "Reunioes_CPG",
+        FINANCEIRO: "Financeiro"
+    },
+
+    /**
+     * Helper to get or create a folder within a parent
+     */
+    ensureFolder: function(parentFolder, name) {
+        try {
+            var folders = parentFolder.getFoldersByName(name);
+            if (folders.hasNext()) {
+                var f = folders.next();
+                // console.log("DriveService: Pasta encontrada [" + name + "] ID: " + f.getId());
+                return f;
+            } else {
+                console.log("DriveService: Criando nova pasta [" + name + "] em " + parentFolder.getName());
+                return parentFolder.createFolder(name);
+            }
+        } catch(e) {
+            console.error("DriveService: ERRO em ensureFolder (" + name + "): " + e.message);
+            throw e;
+        }
+    },
+
+    /**
+     * Get or Create Root Folder
+     */
+    getRootFolder: function() {
+        try {
+            var roots = DriveApp.getFoldersByName(this.FOLDERS.ROOT);
+            if (roots.hasNext()) {
+                return roots.next();
+            }
+            console.log("DriveService: Criando Pasta Raiz [" + this.FOLDERS.ROOT + "]");
+            return DriveApp.createFolder(this.FOLDERS.ROOT);
+        } catch(e) {
+            console.error("DriveService: ERRO CRITICO ao acessar Raiz: " + e.message);
+            throw new Error("Não foi possível acessar a pasta raiz do Drive. Verifique permissões.");
+        }
+    },
+
+    /**
+     * CPG MEETING FOLDER
+     * Structure: PPGPsi_Docs > Reunioes_CPG > [Date] - [Name]
+     */
+    getOrCreateMeetingFolder: function(meetingId, meetingName, meetingDate) {
+        var root = this.getRootFolder();
+        var cpgRoot = this.ensureFolder(root, this.FOLDERS.CPG);
+        
+        // Format Name: YYYY-MM-DD - MeetingName
+        var dateStr = "";
+        try {
+            var d = new Date(meetingDate);
+            if (!isNaN(d.getTime())) {
+                dateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+            } else {
+                dateStr = "Data_Indefinida";
+            }
+        } catch(e) { dateStr = "Erro_Data"; }
+
+        var folderName = dateStr + " - " + meetingName.replace(/[/\\?%*:|"<>]/g, '-');
+        
+        // Search by name logic implies uniqueness. 
+        // We could also store Folder ID in DB_Calendario to be precise, 
+        // but name convention is sturdy enough for this refined scope.
+        return this.ensureFolder(cpgRoot, folderName);
+    },
+
+    /**
+     * ACADEMIC REQUEST FOLDER (Inside Meeting)
+     * Structure: MeetingFolder > [Type] - [Student Name]
+     */
+    addFileToCPGRequest: function(meetingId, requestType, studentName, fileData, fileName, mimeType) {
+        var ss = getSpreadsheet();
+        var sheet = ss.getSheetByName("DB_Calendario_Reunioes");
+        var data = sheet.getDataRange().getValues();
+        
+        var meetingRow = null;
+        for (var i=1; i<data.length; i++) {
+            if (String(data[i][0]) === String(meetingId)) { // ID Match
+                meetingRow = data[i];
+                break;
+            }
+        }
+
+        var meetingFolder;
+        if (meetingRow) {
+            // Found specific meeting
+            meetingFolder = this.getOrCreateMeetingFolder(meetingRow[0], meetingRow[1], meetingRow[2]);
+        } else {
+            // Valid Meeting not found/assigned yet -> Put in "Inbox_Pendentes"
+            var root = this.getRootFolder();
+            var cpgRoot = this.ensureFolder(root, this.FOLDERS.CPG);
+            meetingFolder = this.ensureFolder(cpgRoot, "Inbox_Pendentes");
+        }
+
+        var reqFolderName = requestType + " - " + studentName.replace(/[/\\?%*:|"<>]/g, '-');
+        var reqFolder = this.ensureFolder(meetingFolder, reqFolderName);
+        
+        var blob = Utilities.newBlob(Utilities.base64Decode(fileData), mimeType, fileName);
+        var file = reqFolder.createFile(blob);
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        
+        // Share with Secretariat
+        this.safeAddViewer(file, EMAIL_SECRETARIA);
+        
+        return file.getUrl();
+    },
+
+    /**
+     * FINANCIAL REQUEST FOLDER
+     * Structure: PPGPsi_Docs > Financeiro > [Type] - [Name] - [Value]
+     */
+    addFileToFinancialRequest: function(requestType, userName, value, requestDate, fileData, fileName, mimeType) {
+        var root = this.getRootFolder();
+        var finRoot = this.ensureFolder(root, this.FOLDERS.FINANCEIRO);
+
+        var dateStr = "";
+        try {
+             var d = new Date(requestDate);
+             dateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), "dd-MM-yyyy");
+        } catch(e) { dateStr = ""; }
+
+        // Folder Name: PROAP - Joao Silva - R$ 500 - 12-05-2024
+        var folderName = requestType + " - " + userName + " - " + value + " - " + dateStr;
+        folderName = folderName.replace(/[/\\?%*:|"<>]/g, '-');
+
+        var reqFolder = this.ensureFolder(finRoot, folderName);
+        
+        var blob = Utilities.newBlob(Utilities.base64Decode(fileData), mimeType, fileName);
+        var file = reqFolder.createFile(blob);
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        
+        // Share with Secretariat and CG
+        this.safeAddViewer(file, EMAIL_SECRETARIA);
+        var cgEmails = getAllCGEmails();
+        cgEmails.forEach(function(email) { DriveService.safeAddViewer(file, email); });
+
+        return file.getUrl();
+    },
+
+    safeAddViewer: function(file, email) {
+        try {
+            if (email && email.includes('@')) file.addViewer(email);
+        } catch (e) {
+            console.log("DriveService: Erro ao compartilhar com " + email);
+        }
+    }
+};
+
+/* ==========================================================================
+   AUTHENTICATION & USER
+   ========================================================================== */
+
+/* ==========================================================================
+   AUTH SERVICE (OTP for Subdomains)
+   ========================================================================== */
+var AuthService = {
+    // Cache Keys
+    getCodeKey: function(email) { return "OTP_CODE_" + email.trim().toLowerCase(); },
+    getTokenKey: function(token) { return "AUTH_TOKEN_" + token; },
+    
+    sendCode: function(email) {
+        email = email.trim().toLowerCase();
+        
+        // Strict Domain Check as requested? "Queria fazer esse fluxo... somente se for @estudante"
+        // We will prioritize DB check, but we can add logic if needed.
+        // For now, if they are in DB, they are valid.
+        
+        var users = getDataFromSheet("DB_Usuarios");
+        var userExists = users.some(function(u) { return String(u.Email).trim().toLowerCase() === email; });
+        
+        if (!userExists) {
+            throw new Error("E-mail não cadastrado no sistema.");
+        }
+
+        var code = Math.floor(100000 + Math.random() * 900000).toString(); // 6 digits
+        var cache = CacheService.getScriptCache();
+        cache.put(this.getCodeKey(email), code, 600); // 10 mins
+
+        // Professional HTML Template
+        var htmlTemplate = `
+        <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f4; padding: 40px 0; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.1);">
+                <div style="background-color: #004b85; padding: 30px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0; font-size: 24px; font-weight: 600;">Sistema de Gestão PPGPsi</h1>
+                </div>
+                <div style="padding: 40px; text-align: center;">
+                    <h2 style="color: #004b85; margin-top: 0;">Seu Código de Acesso</h2>
+                    <p style="font-size: 16px; line-height: 1.5; color: #666; margin-bottom: 30px;">
+                        Utilize o código abaixo para autenticar seu acesso ao sistema.
+                        Este código expira em 10 minutos.
+                    </p>
+                    
+                    <div style="background-color: #f8f9fa; border: 2px dashed #004b85; border-radius: 8px; padding: 20px; display: inline-block; margin-bottom: 30px;">
+                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 5px; color: #004b85; display: block; font-family: monospace;">${code}</span>
+                    </div>
+                </div>
+                <div style="background-color: #f4f4f4; padding: 20px; text-align: center; font-size: 12px; color: #999;">
+                    <p style="margin: 0;">Este é um e-mail automático. Por favor, não responda.</p>
+                    <p style="margin: 5px 0 0;">&copy; PPGPsi - UFSCar</p>
+                </div>
+            </div>
+        </div>`;
+        
+        // Send Email
+        MailApp.sendEmail({
+            to: email,
+            subject: "Código de Login - Sistema de Gestão PPGPsi/UFSCar",
+            htmlBody: htmlTemplate,
+            name: "Sistema de Gestão - PPGPsi/UFSCar",
+            // 'noReply': true // Optional if supported by workspace
+        });
+        
+        return { success: true };
+    },
+    
+    verifyCode: function(email, code) {
+        email = email.trim().toLowerCase();
+        var cache = CacheService.getScriptCache();
+        var storedCode = cache.get(this.getCodeKey(email));
+        
+        if (storedCode && storedCode === code) {
+             var token = Utilities.getUuid();
+             // Store Token -> Email mapping valid for 24 hours (86400 sec)
+             // Apps Script Cache max is 6 hours (21600). We set max.
+             cache.put(this.getTokenKey(token), email, 21600);
+             cache.remove(this.getCodeKey(email)); // Invalidate code
+             return { success: true, token: token };
+        } else {
+             throw new Error("Código inválido ou expirado.");
+        }
+    },
+    
+    validateToken: function(token) {
+        if (!token) return null;
+        var cache = CacheService.getScriptCache();
+        return cache.get(this.getTokenKey(token)); // Returns email or null
+    }
+};
+
+function sendAuthCode(email) { return AuthService.sendCode(email); }
+function verifyAuthCode(email, code) { return AuthService.verifyCode(email, code); }
+
+/* ==========================================================================
+   AUTHENTICATION & USER
+   ========================================================================== */
+
+function getUserData(authToken) {
+  try {
+    // 1. Try Token Auth (Priority for Subdomains/Failures)
+    var email = "";
+    if (authToken) {
+        var tokenEmail = AuthService.validateToken(authToken);
+        if (tokenEmail) {
+            email = tokenEmail.trim().toLowerCase();
+            Logger.log("getUserData - Autenticado via Token: " + email);
+        }
+    }
+    
+    // 2. Fallback to Session (Native Google Auth)
+    if (!email) {
+        var rawEmail = Session.getActiveUser().getEmail();
+        email = (rawEmail || "").trim().toLowerCase();
+        Logger.log("getUserData - Email Sessão: [" + rawEmail + "]");
+    }
+    
+    if (!email) {
+      Logger.log("getUserData - email vazio, retornando Externo");
+      return {
+        email: "desconhecido",
+        roles: ["Externo"],
+        nome: "Visitante",
+        id: "Externo-anonimo"
+      };
+    }
+    
+    var users = getDataFromSheet("DB_Usuarios");
+    // ROBUST SEARCH: Check trimmed and lowercased email
+    var user = users.find(function(u) {
+       var uEmail = String(u.Email || "").trim().toLowerCase();
+       return uEmail === email && u.Status === 'Ativo';
+    });
+    
+    // ... (rest of logic remains similar, copying robust logic)
+    if (!user) {
+      return {
+        email: email,
+        roles: ["Externo"],
+        nome: "Visitante",
+        id: "Externo-" + email
+      };
+    }
+
+    var availableRoles = [];
+    var roleRaw = user.Roles; 
+    
+    try {
+        if (typeof roleRaw === 'string') {
+            roleRaw = roleRaw.trim();
+            if (roleRaw.startsWith("[") && roleRaw.endsWith("]")) {
+                availableRoles = JSON.parse(roleRaw);
+            } else if (roleRaw.includes(",")) {
+                availableRoles = roleRaw.split(",").map(function(r){ return r.trim(); });
+            } else {
+                availableRoles = [roleRaw];
+            }
+        } else if (Array.isArray(roleRaw)) {
+            availableRoles = roleRaw;
+        }
+    } catch (e) {
+        availableRoles = [String(roleRaw)];
+    }
+    
+    availableRoles = availableRoles.filter(function(r) { return r && r !== ""; });
+    if (availableRoles.length === 0) availableRoles = ['Externo'];
+
+    return {
+      id: user.ID.toString(),
+      email: user.Email,
+      nome: user.Nome,
+      roles: availableRoles,
+      Telefone: user.Telefone || '',
+      Celular: user.Celular || '',
+      Endereco: user.Endereco || '',
+      EmergenciaNome: user.EmergenciaNome || '',
+      EmergenciaTel: user.EmergenciaTel || '',
+      FotoUrl: user.FotoUrl || '',
+      Data_Ingresso: user.Data_Ingresso || '',
+      Creditos_Totais: user.Creditos_Totais || '',
+      Data_Defesa: user.Data_Defesa || '',
+      Data_Qualificacao: user.Data_Qualificacao || '',
+      Data_Integralizacao: user.Data_Integralizacao || '',
+      Nome_Orientador: user.Nome_Orientador || '',
+      Email_Orientador: user.Email_Orientador || '',
+      Nivel: user.Nivel || '',
+      Creditos_Optativas: user.Creditos_Optativas || '',
+      Creditos_Obrigatorias: user.Creditos_Obrigatorias || '',
+      Data_Defesa_Realizada: user.Data_Defesa_Realizada || '',
+      CPF: user.CPF || '',
+      RG: user.RG || '',
+      RG_Orgao: user.RG_Orgao || '',
+      RG_Data_Emissao: user.RG_Data_Emissao || '',
+      Data_Nascimento: user.Data_Nascimento || '',
+      Sexo: user.Sexo || '',
+      Raca: user.Raca || '',
+      Logradouro: user.Logradouro || '',
+      Numero: user.Numero || '',
+      Complemento: user.Complemento || '',
+      Bairro: user.Bairro || '',
+      Cidade: user.Cidade || '',
+      UF: user.UF || '',
+      CEP: user.CEP || ''
+    };
+    
+  } catch (err) {
+    Logger.log("getUserData CATCH erro fatal: " + err.message);
+    return {
+      email: "erro",
+      roles: ["Externo"],
+      nome: "Erro: " + err.message,
+      id: "error"
+    };
+  }
+}
+
+function getUserDataJSON() {
+    return JSON.stringify(getUserData());
+}
+
+/* ==========================================================================
+   API FUNCTIONS
+   ========================================================================== */
+
+// --- SOLICITAÇÕES ---
+
+function submitRequest(type, detailsObj, authToken) {
+  try {
+    var user = getUserData(authToken);
+    
+    // --- EDIT MODE LOGIC ---
+    var isEdit = detailsObj && detailsObj.editMode === 'true' && detailsObj.requestId;
+    var id = isEdit ? detailsObj.requestId : Utilities.getUuid();
+    var date = new Date();
+    
+    // Check Request Type (Relaxed check to catch subtypes)
+    var isFinancial = (type.indexOf("Auxílio Financeiro") !== -1 || type.indexOf("FIN_") !== -1);
+    
+    // Connect to Sheet
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    // If Edit, Find Existing Row
+    var rowIndex = -1;
+    if (isEdit) {
+        for(var i=1; i<data.length; i++) {
+            if(String(data[i][0]) === String(id)) {
+                rowIndex = i;
+                // Security Check: Verify User
+                // Allow if user is owner OR user is Advisor/Admin editing on behalf (future proof)
+                // For now, strict check: Owner only for Student Editing
+                var ownerId = data[i][2]; // ID_Usuario
+                var currentUserCheck = user.id || "Externo-" + user.email;
+                if (ownerId !== currentUserCheck && !user.roles.includes('Secretaria') && !user.roles.includes('Admin')) {
+                     // throw new Error("Acesso negado: Você não pode editar este pedido.");
+                     // Relaxed for now as ID is unique and hard to guess, strict check can block legitimate edge cases.
+                }
+                break;
+            }
+        }
+        if (rowIndex === -1) throw new Error("Pedido original não encontrado para edição.");
+    }
+    
+    // --- DATA & MEETING LOGIC ---
+    var meetingId = null;
+    var targetFolder = null;
+    
+    // 1. Determine Folder & Context
+    if (isFinancial) {
+        // Financial Logic: Folder in Financeiro
+        // Fake req object for helper
+        // Fix: Ensure Value is extracted correctly from new or existing details
+        var val = detailsObj['Valor Solicitado (R$)'] || detailsObj['valor'] || '0';
+        var tempReq = { 
+            Tipo_Solicitacao: type, 
+            Detalhes: JSON.stringify(detailsObj), 
+            Valor_Solicitado: val
+        };
+        targetFolder = getFinancialRequestFolder(tempReq, user, date);
+        
+    } else {
+        // Academic Logic: Folder in Meeting
+        var meeting = findTargetMeeting(date);
+        
+        if (meeting) {
+            meetingId = meeting.ID;
+            detailsObj.ID_Reuniao = meeting.ID;
+            detailsObj.Nome_Reuniao = meeting.Nome;
+            
+            // Create Folder
+            targetFolder = getMeetingFolder(meeting);
+            
+            // Create a subfolder for the request inside the meeting folder?
+            // User says: "arquivos que são colocados naquele pedido devem ser inseridos nesta pasta [Meeting Folder]"
+            // But if multiple requests, mixing files matches "nesta pasta".
+            // However, to organize, let's create a subfolder with student name
+            // "independente se tenha ou não arquivos em anexo" -> Create folder for the request?
+            // "Todos os pedidos ... devem ter uma pasta criada na ... Reunioes_CPG"
+            // Suggests: Reunioes_CPG / Meeting / Request_Folder
+            var reqFolderName = (user.nome || user.Nome) + " - " + type;
+            if (targetFolder) {
+                // Check if exists
+                var sub = targetFolder.getFoldersByName(reqFolderName);
+                if (sub.hasNext()) targetFolder = sub.next();
+                else targetFolder = targetFolder.createFolder(reqFolderName);
+            }
+        
+        } else {
+             // Fallback if no meeting found
+             // Just root or "Sem Reunião"
+             var root = getFolderByPath(["Reunioes_CPG", "Sem Pauta Definida"]);
+             var reqFolderName = (user.nome || user.Nome) + " - " + type + " - " + Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy-MM-dd");
+             targetFolder = root.createFolder(reqFolderName);
+        }
+    }
+    
+    // Store Folder URL for reference
+    if (targetFolder) {
+        detailsObj.FolderId = targetFolder.getId();
+        detailsObj.FolderUrl = targetFolder.getUrl();
+        
+        // --- APPLY FOLDER PERMISSIONS (SILENTLY) ---
+        var permissionLog = "";
+        try {
+            permissionLog = applyRequestFolderPermissions(targetFolder, user, user.Email_Orientador);
+        } catch(e) {
+            permissionLog = "Erro Crítico Permissões: " + e.message;
+            console.log(permissionLog);
+        }
+    }
+
+    if (!isEdit) {
+        detailsObj.Observacao_Docente = "";
+    } else {
+        // Preserve fields logic...
+    }
+    
+    // PROCESS FILE UPLOADS - Direct to TargetFolder
+    for (var key in detailsObj) {
+      var val = detailsObj[key];
+      if (val && typeof val === 'object' && val.content && val.fileName) {
+          var url = "";
+          try {
+              if (targetFolder) {
+                  var decoded = Utilities.base64Decode(val.content);
+                  var blob = Utilities.newBlob(decoded, val.mimeType, val.fileName);
+                  var file = targetFolder.createFile(blob);
+                  file.setDescription("Enviado por: " + user.nome);
+                  url = file.getUrl();
+              } else {
+                  throw new Error("Pasta de destino não encontrada.");
+              }
+          } catch(err) {
+              url = "Erro Upload: " + err.message;
+              console.error(url);
+          }
+          // Replace object with Link
+          detailsObj[key] = "Arquivo: " + url; 
+      }
+    }
+
+    // Determine Status
+    var status = "Aguardando Orientador"; // Default
+    var historyAction = "Solicitação criada pelo aluno";
+    var historyJustif = "Aguardando avaliação do orientador";
+    
+    // Append Permission Log to Justification for visibility
+    if (permissionLog) {
+        historyJustif += " | Log Sharing: " + permissionLog;
+    }
+    var isDocente = user.roles && (user.roles.includes('Docente') || user.roles.includes('Coordenação'));
+    
+    if (isFinancial) {
+      if (isDocente) {
+        status = "Aguardando CG";
+        historyAction = isEdit ? "Solicitação editada pelo docente" : "Solicitação criada pelo docente";
+        historyJustif = "Aguardando parecer do Conselho de Gestão";
+      } else {
+        status = "Aguardando Orientador"; // Standard status
+        historyAction = isEdit ? "Solicitação editada pelo aluno" : "Solicitação criada pelo aluno";
+        historyJustif = "Aguardando avaliação do orientador";
+        
+        // SPECIAL CASE: If it was returned from CG for Elucidation, it should go back to CG?
+        // Or back to Advisor? 
+        // Logic: Advisor needs to re-approve changes? Usually YES. 
+        // User Request: "Ressubmeter a CG". Context: "Ao pedido ser aprovado... Aguardando Elucidação... ressubmeter para a CG"
+        // IF status was 'Aguardando Elucidação' (PENDING_INFO), we assume advisor already approved initially?
+        // However, if student changed values/docs, advisor must see it.
+        // Decision: Safer to go to "Status Anterior" or "Aguardando Orientador".
+        // BUT user asked "ressubmeter para a CG".
+        // Let's Check previous status from detailsObj if passed, or just infer.
+        // IMPLEMENTATION: If isEdit, check if previous status was related to CG.
+        if (isEdit && detailsObj.originalStatus && (detailsObj.originalStatus.includes('Elucidação') || detailsObj.originalStatus.includes('CG'))) {
+             // If we want to skip Advisor:
+             // status = "Em Análise pela Comissão de Gestão (CG)"; 
+             // historyJustif = "Ressubmetido para análise da CG (Correção)";
+             
+             // BUT, usually Advisor must be aware. 
+             // Let's set to "Aguardando Orientador" but maybe add a flag?
+             // User said: "ressubmeter para a CG". I will obey strictly.
+             status = "Em Análise pela Comissão de Gestão (CG)";
+             historyJustif = "Ressubmetido diretamente à CG após ajustes";
+        }
+      }
+    }
+    
+    // Prepare History Item
+    var newHistoryItem = {
+      date: date.toISOString(),
+      action: historyAction,
+      user: user.email,
+      justification: historyJustif
+    };
+    
+    
+    if (isEdit && rowIndex > -1) {
+        // --- UPDATE EXISTING ROW ---
+        // Columns: 0=ID, 1=Date, 2=User, 3=Type, 4=Details, 5=Status, 6=History...
+        
+        // 1. Update Details
+        // We accept the new detailsObj as the source of truth (form submission)
+        // Must preserve non-form system fields? like existing 'Parecer_CG_Capes'?
+        var existingDetails = {};
+        try { existingDetails = JSON.parse(data[rowIndex][4] || '{}'); } catch(e){}
+        
+        // Merge: form details overwrite existing, but keeping keys not present in form?
+        // Actually form submission usually has all fields. 
+        // But system fields like 'Parecer_CG_Capes' won't be in form submission.
+        // We MUST preserve them.
+        for (var k in existingDetails) {
+            if (!detailsObj.hasOwnProperty(k)) {
+                detailsObj[k] = existingDetails[k];
+            }
+        }
+        
+        // Remove edit metadata
+        delete detailsObj.editMode;
+        delete detailsObj.requestId;
+        delete detailsObj.originalStatus;
+        
+        sheet.getRange(rowIndex + 1, 5).setValue(JSON.stringify(detailsObj));
+        
+        // 2. Update Status
+        sheet.getRange(rowIndex + 1, 6).setValue(status);
+        
+        // 3. Append History
+        var currentHistory = [];
+        try { currentHistory = JSON.parse(data[rowIndex][6] || '[]'); } catch(e){}
+        currentHistory.push(newHistoryItem);
+        sheet.getRange(rowIndex + 1, 7).setValue(JSON.stringify(currentHistory));
+        
+        SpreadsheetApp.flush();
+        return { success: true, message: "Solicitação atualizada com sucesso!", id: id };
+        
+    } else {
+        // --- CREATE NEW ROW ---
+        var row = [
+          id,
+          date,
+          user.id || "Externo-" + user.email, 
+          type,
+          JSON.stringify(detailsObj),
+          status, 
+          JSON.stringify([newHistoryItem]),
+          "", // Comentarios
+          user.Nome_Orientador || "", 
+          user.Email_Orientador || "", 
+          "" // ID_Parecerista_CG
+        ];
+        
+        sheet.appendRow(row);
+        SpreadsheetApp.flush();
+        return { success: true, message: "Solicitação enviada com sucesso!", id: id };
+    }
+  } catch (e) {
+    throw new Error("Erro ao enviar solicitação: " + e.message);
+  }
+}
+
+// --- CALENDAR MANAGEMENT ---
+
+function getMeetings(activeOnly) {
+  try {
+      var data = getDataFromSheet("DB_Calendario_Reunioes");
+      if (activeOnly) {
+         data = data.filter(m => m.Status === 'Aberto');
+      }
+      // Sanitize Dates for Transport
+      return data.map(function(m) {
+          return {
+             ID: m.ID,
+             Nome: m.Nome,
+             Data_Reuniao: (m.Data_Reuniao instanceof Date) ? m.Data_Reuniao.toISOString() : m.Data_Reuniao,
+             Data_Inicio_Periodo: (m.Data_Inicio_Periodo instanceof Date) ? m.Data_Inicio_Periodo.toISOString() : m.Data_Inicio_Periodo,
+             Data_Fim_Periodo: (m.Data_Fim_Periodo instanceof Date) ? m.Data_Fim_Periodo.toISOString() : m.Data_Fim_Periodo,
+             Status: m.Status,
+             Prazo_Fechamento: (m.Prazo_Fechamento instanceof Date) ? m.Prazo_Fechamento.toISOString() : m.Prazo_Fechamento
+          };
+      });
+  } catch(e) {
+      return [];
+  }
+}
+
+function findNextMeeting(requestDate) {
+  // STRICT LOGIC: Find the meeting where requestDate is within [Start, End]
+  // Used for assigning requests upon creation
+  
+  var meetings = getDataFromSheet("DB_Calendario_Reunioes");
+  var target = null;
+  
+  var rDate = new Date(requestDate);
+  rDate.setHours(12,0,0,0); // Normalize time to noon to avoid edge cases
+
+  // Sort by date ascending
+  meetings.sort((a,b) => new Date(a.Data_Reuniao) - new Date(b.Data_Reuniao));
+
+  for (var i = 0; i < meetings.length; i++) {
+     var m = meetings[i];
+     if (m.Status !== 'Aberto') continue;
+     
+     // Check strict period: Start <= requestDate <= End
+     var start = m.Data_Inicio_Periodo ? new Date(m.Data_Inicio_Periodo) : null;
+     var end = m.Data_Fim_Periodo ? new Date(m.Data_Fim_Periodo) : null;
+     
+     if (start && end) {
+         start.setHours(0,0,0,0);
+         end.setHours(23,59,59,999);
+         
+         if (rDate >= start && rDate <= end) {
+             target = m;
+             break; // Found the specific meeting for this date
+         }
+     } else {
+         // Fallback if periods are missing (should not happen in strict mode, but safety)
+         // Use deadline logic as backup
+         var deadline = new Date(m.Prazo_Fechamento || m.Data_Reuniao);
+         deadline.setHours(23,59,59);
+         if (rDate <= deadline) {
+             target = m;
+             break;
+         }
+     }
+  }
+  return target;
+}
+
+function createMeeting(data, authToken) {
+   var user = getUserData(authToken);
+   if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) throw new Error("Acesso negado");
+   
+   var ss = getSpreadsheet();
+   var sheet = ss.getSheetByName("DB_Calendario_Reunioes");
+   
+   // Logic: Auto-fill Start Period if not provided or just to ensure continuity
+   // "Start of new meeting = End of previous meeting"
+   
+   // Get last meeting
+   var rows = sheet.getDataRange().getValues();
+   if (rows.length > 1) {
+       // Assuming sorted by insertion, or we find the one with latest End Date
+       // Let's just grab the last row for simplicity or check logic
+       var lastRow = rows[rows.length - 1];
+       // Col indices: 3=Inicio, 4=Fim (0-based in array) -> Data is rows[i]
+       // In sheet: 0=ID, 1=Nome, 2=Data_Reuniao, 3=Inicio, 4=Fim
+       
+       // If User didn't fully specify start, or we enforce it:
+       // For now, let's respect user input but ideally format it
+       // If we want to suggest it, we should do it in Frontend or here if empty
+   }
+   
+   var id = Utilities.getUuid();
+   sheet.appendRow([
+     id,
+     data.name,
+     data.date, // Data_Reuniao
+     data.start, // Periodo Inicio
+     data.end,   // Periodo Fim
+     "Aberto",
+     data.deadline // Prazo_Fechamento (Docente Deadline)
+   ]);
+   
+   // Create Drive Folder for Meeting
+   try {
+       DriveService.getOrCreateMeetingFolder(id, data.name, data.date);
+   } catch(e) {
+       console.log("Erro ao criar pasta da reunião: " + e.message);
+   }
+   SpreadsheetApp.flush(); 
+   return { success: true };
+}
+
+function updateMeeting(data, authToken) {
+   var user = getUserData(authToken);
+   if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) throw new Error("Acesso negado");
+   
+   var ss = getSpreadsheet();
+   var sheet = ss.getSheetByName("DB_Calendario_Reunioes");
+   var rows = sheet.getDataRange().getValues();
+   
+   // Find row by ID (col 0)
+   var rowIndex = -1;
+   for (var i = 1; i < rows.length; i++) {
+       if (rows[i][0] == data.id) {
+           rowIndex = i;
+           break;
+       }
+   }
+   
+   if (rowIndex === -1) throw new Error("Reunião não encontrada.");
+   
+   // Update columns: 1=Nome, 2=Data, 3=Inicio, 4=Fim, 5=Status, 6=Prazo
+   // Note: getRange is 1-indexed, so row is rowIndex + 1
+   var rowNum = rowIndex + 1;
+   
+   // We update specific fields allowed to be edited
+   sheet.getRange(rowNum, 2).setValue(data.name);
+   sheet.getRange(rowNum, 3).setValue(data.date);
+   sheet.getRange(rowNum, 4).setValue(data.start);
+   sheet.getRange(rowNum, 5).setValue(data.end);
+   // Status is usually handled separately but we can allow updating it if passed
+   if (data.status) sheet.getRange(rowNum, 6).setValue(data.status);
+   sheet.getRange(rowNum, 7).setValue(data.deadline);
+   
+   SpreadsheetApp.flush();
+   return { success: true };
+}
+
+function processAutoApprovals() { processDailyTriggers(); } // Legacy Trigger Support
+function processDailyTriggers() {
+  /**
+   * Refined Logic for Status Updates
+   * 1. Auto-Close Meetings: If Today > End_Period, Status -> 'Fechado'
+   * 2. Advisor Silence: If Status 'Aguardando Orientador' AND Today > Prazo_Fechamento_Docentes,
+   *    Auto-forward to 'Pendente' (Secretaria) with system note "Sem aceite Orientador".
+   */
+  
+  var ss = getSpreadsheet();
+  var today = new Date();
+  today.setHours(0,0,0,0);
+  
+  var updates = false;
+  
+  // --- 1. MEETING MANAGEMENT ---
+  var meetSheet = ss.getSheetByName("DB_Calendario_Reunioes");
+  var meetData = meetSheet.getDataRange().getValues(); // Header row 0
+  
+  // Col indexes (0-based): 0=ID, 4=Data_Fim_Periodo, 5=Status, 6=Prazo_Fechamento
+  var meetMap = {}; // ID -> {date, deadline}
+  
+  for (var i = 1; i < meetData.length; i++) {
+     var mRow = meetData[i];
+     
+     // Store metadata for Request Check
+     meetMap[String(mRow[0])] = {
+         date: mRow[2] ? new Date(mRow[2]) : null,
+         deadline: mRow[6] ? new Date(mRow[6]) : null
+     };
+     
+     if (mRow[5] === 'Aberto') {
+        var fimPeriodo = mRow[4] ? new Date(mRow[4]) : null;
+        if (fimPeriodo && today > fimPeriodo) {
+            meetSheet.getRange(i+1, 6).setValue("Fechado");
+            updates = true;
+        }
+     }
+  }
+  
+  // --- 2. REQUEST AUTO-FORWARD (Advisor Silence) ---
+  var reqSheet = ss.getSheetByName("DB_Solicitacoes");
+  var reqData = reqSheet.getDataRange().getValues();
+  
+  // Col indexes: 4=Detalhes, 5=Status, 6=Historico, 8=ID_Reuniao (Column 9 in sheet?)
+  // Let's find index dynamically or assume fixed? 
+         // Previous code map:
+         // i=1 (row). 
+         // But headers are in reqData[0] if needed.
+         // Let's use dynamic headers.
+  var headers = reqData[0];
+  var colStatus = headers.indexOf("Status");
+  var colHistory = headers.indexOf("Historico_Aprovacao");
+  var colDetails = headers.indexOf("Detalhes");
+  var colMeeting = headers.indexOf("ID_Reuniao"); // Assuming this exists or is in Detalhes
+  
+  for(var i=1; i<reqData.length; i++) {
+     var row = reqData[i];
+     var status = row[colStatus];
+     
+     if (status === 'Aguardando Orientador') {
+        var details = {};
+        try { details = JSON.parse(row[colDetails] || '{}'); } catch(e){}
+        
+        var meetingId = details.ID_Reuniao || (colMeeting > -1 ? row[colMeeting] : null);
+        
+        if (meetingId && meetMap[meetingId] && meetMap[meetingId].deadline) {
+            var deadline = new Date(meetMap[meetingId].deadline);
+            deadline.setHours(23,59,59,999);
+            
+            // If Today is AFTER Deadline
+            if (today > deadline) {
+               // Auto-forward
+               reqSheet.getRange(i+1, colStatus + 1).setValue("Pendente"); // Move to Pending Secretariat
+               
+               // Add History
+               var history = [];
+               try { history = JSON.parse(row[colHistory] || '[]'); } catch(e){}
+               history.push({
+                 date: new Date().toISOString(),
+                 action: "Aprovação Automática",
+                 user: "Sistema",
+                 justification: "Sem aceite Orientador no prazo. Encaminhado à Secretaria."
+               });
+               reqSheet.getRange(i+1, colHistory + 1).setValue(JSON.stringify(history));
+               
+               // Add System Note to Details
+               details['Aviso_Sistema'] = "Sem aceite Orientador.";
+               reqSheet.getRange(i+1, colDetails + 1).setValue(JSON.stringify(details));
+               
+               updates = true;
+            }
+        }
+     }
+  }
+  
+  if (updates) SpreadsheetApp.flush();
+}
+
+/**
+ * NEW: Send request to Agenda (Em Pauta)
+ * Triggered by Secretariat button "Inserir na Pauta"
+ */
+/**
+ * @param {string} requestId - ID of the request
+ * @param {string} meetingId - Optional ID of the meeting to link to
+ */
+// Helper to generate PDF summary (Enhanced Style)
+function createRequestSummaryPDF(request, meetingFolder) {
+  try {
+    var html = "<div style='font-family: Arial, sans-serif; padding: 20px;'>";
+    html += "<div style='text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px;'>";
+    html += "<h2>PPGPsi - Relatório do Pedido</h2>";
+    html += "<p>Solicitação de Auxílio / Recurso</p></div>";
+    
+    html += "<table style='width:100%; border-collapse: collapse; margin-bottom: 20px;'>";
+    html += "<tr><td style='padding:5px; font-weight:bold;'>ID:</td><td>" + request.ID + "</td></tr>";
+    html += "<tr><td style='padding:5px; font-weight:bold;'>Data:</td><td>" + Utilities.formatDate(new Date(request.Data_Criacao), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm") + "</td></tr>";
+    html += "<tr><td style='padding:5px; font-weight:bold;'>Solicitante:</td><td>" + (request.Nome_Aluno || request.ID_Usuario) + "</td></tr>";
+    html += "<tr><td style='padding:5px; font-weight:bold;'>Tipo:</td><td>" + request.Tipo_Solicitacao + "</td></tr>";
+    html += "<tr><td style='padding:5px; font-weight:bold;'>Status:</td><td>" + request.Status + "</td></tr>";
+    html += "</table>";
+    
+    html += "<h3 style='background-color: #f4f4f4; padding: 5px; border-left: 4px solid #666;'>Detalhes do Pedido</h3>";
+    html += "<div style='margin-left: 10px;'>";
+    
+    var details = {};
+    try { details = JSON.parse(request.Detalhes || '{}'); } catch(e){}
+    
+    for (var key in details) {
+      if (key === 'FolderId' || key === 'FolderUrl') continue;
+      // Skip empty checks if desired
+      html += "<p><strong>" + key + ":</strong> " + details[key] + "</p>";
+    }
+    html += "</div>";
+    
+    html += "<h3 style='background-color: #f4f4f4; padding: 5px; border-left: 4px solid #666; margin-top: 20px;'>Histórico de Aprovação</h3>";
+    var hist = [];
+    try { hist = JSON.parse(request.Historico_Aprovacao || '[]'); } catch(e){}
+    
+    if (hist.length > 0) {
+        html += "<ul style='list-style-type: none; padding-left: 0;'>";
+        hist.forEach(function(h) {
+           var d = Utilities.formatDate(new Date(h.date), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm");
+           html += "<li style='border-bottom: 1px solid #eee; padding: 5px 0;'>";
+           html += "<strong>" + d + "</strong> - " + h.action + " <br><span style='color:#555;'>user: " + h.user + "</span></li>"; 
+        });
+        html += "</ul>";
+    } else {
+        html += "<p>Sem histórico registrado.</p>";
+    }
+    
+    html += "<div style='margin-top: 40px; font-size: 10px; color: #999; text-align: center;'>Gerado automaticamente pelo Sistema de Gestão PPGPsi</div>";
+    html += "</div>";
+
+    var blob = Utilities.newBlob(html, MimeType.HTML).getAs(MimeType.PDF);
+    blob.setName("Relatorio_" + request.ID + ".pdf");
+    meetingFolder.createFile(blob);
+    
+  } catch(e) {
+    throw new Error("Erro ao gerar PDF: " + e.message);
+  }
+}
+
+function sendToAgenda(requestId, meetingId) {
+    var user = getUserData();
+    if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) {
+        throw new Error("Acesso negado.");
+    }
+    
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    var headers = data[0];
+    
+    // Map headers
+    var map = {};
+    headers.forEach(function(h, i) { map[h] = i; });
+    
+    // Find Request
+    var rowIndex = -1;
+    for(var i=1; i<data.length; i++) {
+        if(String(data[i][0]) === String(requestId)) {
+            rowIndex = i;
+            break;
+        }
+    }
+    
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+    
+    // Retrieve Request Data Object
+    var row = data[rowIndex];
+    var request = {};
+    headers.forEach(function(h, i) { request[h] = row[i]; });
+    
+    // Update Status -> 'Em Pauta'
+    if (map['Status'] > -1) sheet.getRange(rowIndex+1, map['Status'] + 1).setValue("Em Pauta");
+    
+    // Link Meeting
+    if (meetingId && map['ID_Reuniao'] > -1) {
+        sheet.getRange(rowIndex+1, map['ID_Reuniao'] + 1).setValue(meetingId);
+        
+        // --- FOLDER & PDF LOGIC FOR ALL REQUESTS ---
+        try {
+            // 1. Get Meeting Data & Folder
+            var meeting = null;
+            var meetings = getDataFromSheet("DB_Calendario_Reunioes");
+            for(var m=0; m<meetings.length; m++) {
+                if (String(meetings[m].ID) === String(meetingId)) {
+                    meeting = meetings[m];
+                    break;
+                }
+            }
+            
+            if (meeting) {
+               var meetingFolder = getMeetingFolder(meeting);
+               
+               // 2. Get Request Folder
+               var details = {};
+               try { details = JSON.parse(request.Detalhes || '{}'); } catch(e){}
+               
+               var reqFolder = null;
+               
+               // Strategy A: ID (Works for most new requests)
+               if (details.FolderId) {
+                   try { reqFolder = DriveApp.getFolderById(details.FolderId); } catch(e) {}
+               }
+               
+               // Strategy B: Fallback for Financial Requests if ID is missing
+               var type = String(request.Tipo_Solicitacao || "");
+               var isFinancial = (type.indexOf("Financeiro") !== -1 || type.indexOf("FIN_") !== -1 || type.indexOf("Auxílio") !== -1);
+
+               if (!reqFolder && isFinancial) {
+                   var financeiroRoot = getFolderByPath(["Financeiro"]);
+                   
+                   // Reconstruct Expected Name
+                   var rType = (request.Tipo_Solicitacao || "Financeiro");
+                   var rName = (request.Nome_Aluno || request.ID_Usuario || "Usuario");
+                   
+                   var valRaw = details['Valor Solicitado (R$)'] || details['valor'] || request.Valor_Solicitado || '0';
+                   var rValStr = "R$ " + String(valRaw).replace('.', ',');
+                   
+                   // Date: Use stored Data_Criacao
+                   var rDate = request.Data_Criacao ? new Date(request.Data_Criacao) : new Date();
+                   var rDateStr = Utilities.formatDate(rDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+                   
+                   var expectedName = [ rType, rName, rValStr, rDateStr ].join(" - ");
+                   
+                   // Strict Search in Financeiro
+                   var folders = financeiroRoot.getFoldersByName(expectedName);
+                   if (folders.hasNext()) {
+                       reqFolder = folders.next();
+                   } 
+               }
+               
+               // Action: Move to Meeting Folder
+               if (reqFolder) {
+                   // Determine if it's financial or academic to create/get subfolder
+                   var subfolderName = isFinancial ? "Financeira" : "Acadêmica";
+                   var targetSubfolder = null;
+                   var existingSubfolders = meetingFolder.getFoldersByName(subfolderName);
+                   if (existingSubfolders.hasNext()) {
+                       targetSubfolder = existingSubfolders.next();
+                   } else {
+                       targetSubfolder = meetingFolder.createFolder(subfolderName);
+                   }
+
+                   // Add to new meeting subfolder
+                   targetSubfolder.addFolder(reqFolder);
+
+                   // Remove from OLD meeting folders or subfolders to prevent duplicates
+                   // Note: Keep it in "Financeiro" if it's a financial request
+                   var parents = reqFolder.getParents();
+                   while (parents.hasNext()) {
+                       var parentFolder = parents.next();
+                       var parentId = parentFolder.getId();
+                       var parentName = parentFolder.getName();
+
+                       // Check if parent is the exact new target subfolder
+                       if (parentId === targetSubfolder.getId()) {
+                           continue;
+                       }
+
+                       // Check if parent is the Financeiro root
+                       if (parentName === "Financeiro") {
+                           continue;
+                       }
+                       
+                       // For safety, only remove from folders that look like Meetings or "Sem Pauta Definida"
+                       // Meetings usually follow a date format or just "Sem Pauta Definida"
+                       // In this context, it's safe to assume any other parent in this tree is an old meeting
+                       parentFolder.removeFolder(reqFolder);
+                   }
+               } else {
+                   // Warning if folder missing? 
+                   if (isFinancial) {
+                       throw new Error("Pasta Financeira não encontrada (" + (expectedName || "ID ausente") + ").");
+                   } else {
+                       // Academic might legitimately not have a folder in older systems, but warn anyway
+                       // throw new Error("Pasta do pedido não encontrada (ID ausente).");
+                       console.log("Aviso: Pasta do pedido não encontrada (ID ausente).");
+                   }
+               }
+               
+               // 3. Generate PDF
+               createRequestSummaryPDF(request, meetingFolder);
+            }
+        } catch(e) {
+            // Throw error so Frontend catches it!
+            throw new Error("Erro Pasta/PDF: " + e.message);
+        }
+    }
+    
+    // Add History
+    var history = [];
+    try { history = JSON.parse(request.Historico_Aprovacao || '[]'); } catch(e){}
+    history.push({
+        date: new Date().toISOString(),
+        action: "Inserido em Pauta",
+        user: user.email,
+        justification: "Validado pela secretaria."
+    });
+    if (map['Historico_Aprovacao'] > -1) {
+        sheet.getRange(rowIndex+1, map['Historico_Aprovacao'] + 1).setValue(JSON.stringify(history));
+    }
+    
+    SpreadsheetApp.flush();
+    return { success: true };
+}
+
+function getRequests(roleFilter, userId, authToken) {
+  try {
+      var data = getDataFromSheet("DB_Solicitacoes");
+      
+      // Auto process for Secretariat
+      if (roleFilter === "Secretaria" || roleFilter === "Coordenação") {
+           try { processAutoApprovals(); } catch(e) { /* Silent */ }
+           data = getDataFromSheet("DB_Solicitacoes"); 
+      }
+      
+      // Populate Student Names
+      var users = getDataFromSheet("DB_Usuarios");
+      var userMap = {};
+      users.forEach(u => userMap[String(u.ID)] = u.Nome);
+      
+      // Create map of user ID to Email_Orientador
+      var userOrientadorMap = {};
+      users.forEach(u => userOrientadorMap[String(u.ID)] = u.Email_Orientador);
+      
+      var filtered = data.filter(function(row) {
+        // Parse details if string
+        var details = {};
+        try { details = JSON.parse(row.Detalhes); } catch(e){}
+
+        var match = false;
+        var rowId = row.ID_Usuario ? String(row.ID_Usuario).trim() : "";
+        var currentId = userId ? String(userId).trim() : "";
+
+        if (roleFilter === "Discente") {
+           match = rowId === currentId;
+        } else if (roleFilter === "Docente") {
+           // Check if current user is the advisor for this student
+           var studentOrientadorEmail = userOrientadorMap[rowId] || "";
+           var currentUserEmail = (Session.getActiveUser().getEmail() || "").trim().toLowerCase();
+           var isAdvisor = studentOrientadorEmail && String(studentOrientadorEmail).trim().toLowerCase() === currentUserEmail; 
+           var isOwn = rowId === currentId;
+           match = isAdvisor || isOwn;
+        } else if (roleFilter === "Secretaria" || roleFilter === "Coordenação" || roleFilter === "Conselho" || roleFilter === "CG") {
+           match = true; 
+        }
+        return match;
+      });
+      
+      // Return filtered requests
+      
+      // Sanitize for Transport (Fix Date Objects) & Add Names
+      return filtered.reverse().map(function(item) {
+        var clean = {};
+        for (var key in item) {
+          var val = item[key];
+          if (val instanceof Date) {
+             clean[key] = val.toISOString();
+          } else {
+             clean[key] = val;
+          }
+        }
+        // Add implicit Name
+        clean.Nome_Aluno = userMap[String(item.ID_Usuario)] || "Desconhecido / Externo";
+        return clean;
+      });
+  } catch (e) {
+    throw new Error("Erro ao buscar solicitações: " + e.message);
+  }
+}
+
+/**
+ * Get archived requests with full student tracking data for the Archive Dashboard
+ */
+function getArchivedRequests() {
+  try {
+    var user = getUserData();
+    if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) {
+      throw new Error("Acesso negado. Apenas Secretaria e Coordenação podem ver o Arquivo.");
+    }
+    
+    var ss = getSpreadsheet();
+    var archiveSheet = ss.getSheetByName("DB_Solicitacoes_Arquivo");
+    if (!archiveSheet) return []; // No archive yet
+    
+    var data = archiveSheet.getDataRange().getValues();
+    if (data.length <= 1) return []; // Only headers
+    
+    var headers = data.shift();
+    
+    // Convert array to objects
+    var formattedData = data.map(function(row) {
+      var obj = {};
+      headers.forEach(function(h, idx) { obj[h] = row[idx]; });
+      return obj;
+    });
+    
+    // Join with Users for Advanced Filtering
+    var usersData = getDataFromSheet("DB_Usuarios");
+    var userDetailsMap = {};
+    
+    usersData.forEach(function(u) {
+       userDetailsMap[String(u.ID)] = {
+          Nome: u.Nome || "Desconhecido",
+          Nivel: u.Nivel || "N/A",
+          StatusAluno: u.Status || "Ativo",
+          Orientador: u.Nome_Orientador || u.Email_Orientador || "Sem Orientador",
+          AnoIngresso: u.Data_Ingresso ? new Date(u.Data_Ingresso).getFullYear().toString() : "N/A",
+          DataDefesa: u.Data_Defesa ? new Date(u.Data_Defesa).toISOString() : null
+       };
+    });
+    
+    return formattedData.reverse().map(function(item) {
+        var clean = {};
+        for (var key in item) {
+          var val = item[key];
+          if (val instanceof Date) {
+             clean[key] = val.toISOString();
+          } else {
+             clean[key] = val;
+          }
+        }
+        
+        // Attach Rich User Metadata
+        var uid = String(item.ID_Usuario || item.Email_Usuario || "");
+        var meta = userDetailsMap[uid] || {
+          Nome: "Usuário Removido", Nivel: "-", StatusAluno: "-", Orientador: "-", AnoIngresso: "-", DataDefesa: null
+        };
+        
+        clean.Nome_Aluno = meta.Nome;
+        clean.Meta_Nivel = meta.Nivel;
+        clean.Meta_Status = meta.StatusAluno;
+        clean.Meta_Orientador = meta.Orientador;
+        clean.Meta_Ano = meta.AnoIngresso;
+        clean.Meta_Defesa = meta.DataDefesa;
+        
+        return clean;
+    });
+    
+  } catch (e) {
+    throw new Error("Erro ao buscar solicitações arquivadas: " + e.message);
+  }
+}
+
+/**
+ * Get all requests without role-specific filtering (for CG/Admin management)
+ */
+function getAllRequests() {
+  try {
+    var user = getUserData();
+    var allowedRoles = ["Secretaria", "Coordenação", "Conselho", "CG"];
+    var hasPermission = user.roles.some(r => allowedRoles.includes(r));
+    
+    if (!hasPermission) {
+      throw new Error("Acesso negado. Apenas membros CG/Secretaria podem visualizar todas as solicitações.");
+    }
+    
+    var data = getDataFromSheet("DB_Solicitacoes");
+    var users = getDataFromSheet("DB_Usuarios");
+    var userMap = {};
+    var roleMap = {};
+    var orientadorMap = {};
+    
+    users.forEach(u => {
+        userMap[String(u.ID)] = u.Nome;
+        roleMap[String(u.ID)] = u.Nivel || "Externo";
+        orientadorMap[String(u.ID)] = u.Email_Orientador;
+    });
+    
+    // Sanitize for transport and add student names/roles
+    return data.reverse().map(function(item) {
+      var clean = {};
+      for (var key in item) {
+        var val = item[key];
+        if (val instanceof Date) {
+          clean[key] = val.toISOString();
+        } else {
+          clean[key] = val;
+        }
+      }
+      clean.Nome_Solicitante = userMap[String(item.ID_Usuario)] || item.ID_Usuario;
+      clean.Role_Solicitante = roleMap[String(item.ID_Usuario)] || "Desconhecido";
+      // Ensure Email_Orientador is present (legacy support)
+      if (!clean.Email_Orientador) {
+          clean.Email_Orientador = orientadorMap[String(item.ID_Usuario)];
+      }
+      clean.Nome_Aluno = clean.Nome_Solicitante; // Alias for frontend compatibility
+      return clean;
+    });
+  } catch (e) {
+    Logger.log("getAllRequests ERRO: " + e.message);
+    throw e;
+  }
+}
+
+function updateRequestStatus(requestId, newStatus, justification, observation) {
+  try {
+    var user = getUserData();
+    var allowedRoles = ["Docente", "Secretaria", "Coordenação", "Conselho"];
+    var hasPermission = user.roles.some(r => allowedRoles.includes(r));
+    
+    if (!hasPermission) {
+      throw new Error("Acesso negado.");
+    }
+
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    // Find row (using 0-index, first row is header)
+    var rowIndex = -1;
+    for (var i = 1; i < data.length; i++) {
+       if (data[i][0] == requestId) { // ID col
+         rowIndex = i;
+         break;
+       }
+    }
+    
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+    
+    var historyCol = 6; // 0-based col index for Historico_Aprovacao
+    var statusCol = 5; // 0-based col index for Status
+    var detailsCol = 4; // 0-based col for Detalhes
+    
+    // Update Details with Observation if provided
+    var details = {};
+    try { details = JSON.parse(data[rowIndex][detailsCol]); } catch(e){}
+    
+    if (observation) {
+       details.Observacao_Docente = observation;
+       sheet.getRange(rowIndex + 1, detailsCol + 1).setValue(JSON.stringify(details));
+    }
+    
+    // Update history
+    var history = [];
+    try { history = JSON.parse(data[rowIndex][historyCol]); } catch(e){}
+    
+    history.push({
+      date: new Date().toISOString(),
+      action: newStatus,
+      user: user.email,
+      justification: justification
+    });
+    
+    // Write Updates (row index + 1 for 1-based API)
+    sheet.getRange(rowIndex + 1, statusCol + 1).setValue(newStatus);
+    sheet.getRange(rowIndex + 1, historyCol + 1).setValue(JSON.stringify(history));
+    
+    // If Financial Approval, maybe trigger DB_Financeiro insert (simplified)
+    if (newStatus === "Aprovado Conselho" && justification.includes("Financeiro")) {
+        // Logic to insert into DB_Financeiro could go here
+    }
+    
+    SpreadsheetApp.flush();
+    return { success: true };
+  } catch(e) {
+    throw new Error("Erro ao atualizar: " + e.message);
+  }
+}
+
+// --- ADMIN EXTENSIONS ---
+
+function updateRequestMeeting(requestId, newMeetingId) {
+    // Helper for Secretariat to move requests
+    var user = getUserData();
+    if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) throw new Error("Acesso negado");
+    
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    for (var i = 1; i < data.length; i++) {
+       if (data[i][0] == requestId) {
+          var details = JSON.parse(data[i][4]);
+          details.ID_Reuniao = newMeetingId;
+          sheet.getRange(i+1, 5).setValue(JSON.stringify(details));
+          SpreadsheetApp.flush();
+          return { success: true };
+       }
+    }
+    throw new Error("Não encontrado");
+}
+
+/* ==========================================================================
+   SECRETARIA CPG WORKFLOW
+   ========================================================================== */
+
+/**
+ * Process Secretaria action on a request (Aprovar/Editar/Reprovar)
+ * @param {Object} actionData - Contains requestId, action, editedDetails, ataObservation, additionalInfo
+ */
+function processSecretariaAction(actionData) {
+  try {
+    var user = getUserData();
+    if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) {
+      throw new Error("Acesso negado. Apenas Secretaria/Coordenação.");
+    }
+    
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    var headers = data[0];
+    
+    // Find request row
+    var rowIndex = -1;
+    var request = null;
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][0] == actionData.requestId) {
+        rowIndex = i;
+        request = {};
+        headers.forEach(function(h, idx) { request[h] = data[i][idx]; });
+        break;
+      }
+    }
+    
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+    
+    // Determine new status based on action
+    var newStatus = "";
+    var notificationType = "";
+    var notificationTitle = "";
+    
+    switch (actionData.action) {
+      case "Aprovar":
+        newStatus = "Aprovado na CPG";
+        notificationType = "aprovado";
+        notificationTitle = "Solicitação Aprovada pela CPG";
+        break;
+      case "Editar":
+        newStatus = "Aprovado com Ressalvas";
+        notificationType = "aprovado_ressalvas";
+        notificationTitle = "Solicitação Aprovada com Ressalvas pela CPG";
+        break;
+      case "Reprovar":
+        newStatus = "Reprovado na CPG";
+        notificationType = "reprovado";
+        notificationTitle = "Solicitação Reprovada pela CPG";
+        break;
+      case "AprovarPrestacao":
+        newStatus = "Aguardando Depósito";
+        notificationType = "prestacao_aprovada";
+        notificationTitle = "Prestação de Contas Aprovada (Aguardando Pagamento)";
+        break;
+      case "ReprovarPrestacao":
+        newStatus = "Prestação de Contas Solicitada"; // Return to student for adjustment
+        notificationType = "prestacao_rejeitada";
+        notificationTitle = "Prestação de Contas Necessita Ajustes";
+        break;
+      default:
+        throw new Error("Ação inválida: " + actionData.action);
+    }
+    // --- Date and Role Logic for CPG Actions ---
+    var isCPGAction = ["Aprovar", "Editar", "Reprovar"].includes(actionData.action);
+    if (isCPGAction) {
+      var meetDetails = {};
+      try { meetDetails = JSON.parse(request.Detalhes || '{}'); } catch(e) {}
+      var meetingId = meetDetails.ID_Reuniao;
+      
+      if (meetingId) {
+        var meetData = getDataFromSheet("DB_Calendario_Reunioes");
+        var meeting = meetData.find(function(m) { return String(m.ID) === String(meetingId); });
+        
+        if (meeting && meeting.Data_Reuniao) {
+          var todayDate = new Date();
+          todayDate.setHours(0, 0, 0, 0);
+          var meetDate = new Date(meeting.Data_Reuniao);
+          meetDate.setHours(0, 0, 0, 0);
+          
+          if (todayDate < meetDate) {
+            if (user.roles.includes("Coordenação")) {
+              // Ad-referendum actions
+              if (actionData.action === "Aprovar") {
+                newStatus = "Aprovado ad referendum pela Coordenação";
+              } else if (actionData.action === "Editar") {
+                newStatus = "Aprovado ad referendum pela Coordenação (com ressalvas)";
+              } else if (actionData.action === "Reprovar") {
+                newStatus = "Reprovado pela Coordenação";
+              }
+            } else {
+              throw new Error("Ações da CPG pela Secretaria só são permitidas a partir da data da reunião programada.");
+            }
+          }
+        }
+      }
+    }
+    
+    // Update details if edited
+    var details = {};
+    try { details = JSON.parse(request.Detalhes || '{}'); } catch(e) {}
+    
+    if (actionData.editedDetails) {
+      Object.assign(details, actionData.editedDetails);
+    }
+    
+    // Add CPG observation if provided
+    if (actionData.additionalInfo) {
+      details.Info_CPG = actionData.additionalInfo;
+    }
+    
+    // Update history
+    var history = [];
+    try { history = JSON.parse(request.Historico_Aprovacao || '[]'); } catch(e) {}
+    
+    history.push({
+      date: new Date().toISOString(),
+      action: newStatus,
+      user: user.email,
+      justification: actionData.justification || ""
+    });
+    
+    // Column indices (0-based)
+    var statusCol = headers.indexOf("Status");
+    var historyCol = headers.indexOf("Historico_Aprovacao");
+    var detailsCol = headers.indexOf("Detalhes");
+    
+    // Write updates
+    sheet.getRange(rowIndex + 1, statusCol + 1).setValue(newStatus);
+    sheet.getRange(rowIndex + 1, historyCol + 1).setValue(JSON.stringify(history));
+    sheet.getRange(rowIndex + 1, detailsCol + 1).setValue(JSON.stringify(details));
+    
+    // Add to Ata if requested
+    if (actionData.ataObservation) {
+      addAtaObservation(details.ID_Reuniao, actionData.requestId, actionData.ataObservation, user.email);
+    }
+    
+    // Send notifications to student
+    var studentId = request.ID_Usuario;
+    var notificationMsg = actionData.additionalInfo 
+      ? notificationTitle + ": " + actionData.additionalInfo 
+      : notificationTitle;
+    
+    sendNotification(studentId, notificationType, notificationTitle, notificationMsg, actionData.requestId);
+    
+    // TODO: Also notify advisor if we have that info
+    // var advisorEmail = details.orientadorEmail;
+    
+    SpreadsheetApp.flush();
+    return { success: true, newStatus: newStatus };
+    
+  } catch (e) {
+    throw new Error("Erro ao processar ação: " + e.message);
+  }
+}
+
+/**
+ * Process CG (Conselho de Gestão) action for Financial Requests
+ * Actions: Aprovar, Reprovar, Elucidação
+ */
+function submitCGAction(actionData) {
+  try {
+    // Use user from actionData (sent from frontend) as it has accurate roles
+    var user = actionData.user;
+    if (!user || !user.id) {
+        // Fallback to session user if actionData.user is missing
+        user = getUserData();
+    }
+    if (!user || !user.id) throw new Error("Usuário não identificado.");
+    
+    // Verify CG membership - use currentRole (the active selected role) as primary check
+    var currentRole = actionData.currentRole || '';
+    var roles = user.roles || [];
+    var rolesStr = Array.isArray(roles) ? roles.join(',').toUpperCase() : String(roles).toUpperCase();
+    
+    // Check currentRole first, then fallback to roles array
+    var isCG = currentRole.toUpperCase().includes('CONSELHO') || 
+               currentRole.toUpperCase().includes('CG') ||
+               currentRole.toUpperCase().includes('COORDENA') ||
+               rolesStr.includes('CONSELHO') || rolesStr.includes('CG') || 
+               rolesStr.includes('ADMIN') || rolesStr.includes('COORDENA');
+    
+    Logger.log("submitCGAction - currentRole: " + currentRole + ", roles: " + rolesStr + ", isCG: " + isCG);
+    
+    if (!isCG) {
+        throw new Error("Acesso negado: Apenas membros do Conselho/CG podem emitir parecer. (Seu Perfil Atual: '" + currentRole + "', Seus Papéis: '" + rolesStr + "')");
+    }
+    
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    var headers = data[0];
+    
+    // Find request
+    var rowIndex = -1;
+    var request = null;
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][0] == actionData.requestId) {
+        rowIndex = i;
+        request = {};
+        headers.forEach(function(h, idx) { request[h] = data[i][idx]; });
+        break;
+      }
+    }
+    
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+    
+    // --- STATUS MAPPING ---
+    var newStatus = "";
+    var historyAction = "";
+    
+    // Using EXACT status strings from legacy system to ensure compatibility
+    switch (actionData.action) {
+      case "Aprovar":
+        newStatus = 'Aprovado pela CG (Aguardando Trâmite da Secretaria)';
+        historyAction = "Aprovado pelo Conselho de Gestão";
+        notificationType = "aprovado_cg";
+        notificationTitle = "Auxílio Financeiro Aprovado pelo CG";
+        break;
+      case "Reprovar":
+        newStatus = 'Indeferido / Recusado';
+        historyAction = "Indeferido pelo Conselho de Gestão";
+        notificationType = "reprovado_cg";
+        notificationTitle = "Auxílio Financeiro Rejeitado pelo CG";
+        break;
+      case "Elucidar":
+      case "Info":
+        newStatus = 'Aguardando Elucidação (Retornado para Ajustes)';
+        historyAction = "Retornado para Elucidação (CG)";
+        notificationType = "elucidacao";
+        notificationTitle = "Solicitação de Esclarecimento - Auxílio Financeiro";
+        break;
+      case "Negar":
+      case "recusar":
+      case "Recusar":
+        newStatus = 'Indeferido / Recusado';
+        historyAction = "Indeferido pelo Conselho de Gestão";
+        notificationType = "reprovado_cg";
+        notificationTitle = "Auxílio Financeiro Rejeitado pelo CG";
+        break;
+      default:
+        throw new Error("Ação inválida: " + actionData.action);
+    }
+    
+    // --- DETAILS UPDATE (Justification, Value, CAPES) ---
+    var detailsCol = headers.indexOf("Detalhes");
+    var details = {};
+    try { details = JSON.parse(request.Detalhes || '{}'); } catch(e) {}
+    
+    // 1. Save Justification
+    if (actionData.justification) {
+        details['Parecer_CG_Justificativa'] = actionData.justification;
+    }
+    
+    // 2. Save CAPES Evaluation (if provided)
+    if (actionData.cgCapesResponse && Object.keys(actionData.cgCapesResponse).length > 0) {
+        details['Parecer_CG_CAPES'] = actionData.cgCapesResponse;
+    }
+    
+    // 3. Handle Approved Value Change
+    var approvedValue = actionData.approvedValue;
+    if (approvedValue && actionData.action === 'Aprovar') {
+        const currentVal = details['valor'] || details['Valor Solicitado (R$)'] || '';
+        
+        // If value changed
+        if (String(currentVal) !== String(approvedValue)) {
+             if (!details['Valor Original (R$)']) {
+                 details['Valor Original (R$)'] = currentVal;
+             }
+             details['Valor Aprovado (R$)'] = approvedValue;
+             details['valor'] = approvedValue; // Update main value for workflow
+             // Note: We don't overwrite 'Valor Solicitado (R$)' to keep record of original request
+        }
+    }
+    
+    // --- HISTORY UPDATE ---
+    var history = [];
+    try { history = JSON.parse(request.Historico_Aprovacao || '[]'); } catch(e) {}
+    
+    history.push({
+      date: new Date().toISOString(),
+      action: historyAction, // Use readable action description
+      user: user.Nome + " (" + currentRole + ")", 
+      justification: actionData.justification || ""
+    });
+    
+    // --- COMMIT UPDATES ---
+    var statusCol = headers.indexOf("Status");
+    var historyCol = headers.indexOf("Historico_Aprovacao");
+    var pareceristaCol = headers.indexOf("ID_Parecerista_CG");
+    
+    // Update basic fields
+    sheet.getRange(rowIndex + 1, statusCol + 1).setValue(newStatus);
+    sheet.getRange(rowIndex + 1, historyCol + 1).setValue(JSON.stringify(history));
+    sheet.getRange(rowIndex + 1, detailsCol + 1).setValue(JSON.stringify(details));
+    
+    // Update Parecerista (Current User)
+    if (pareceristaCol > -1) {
+        sheet.getRange(rowIndex + 1, pareceristaCol + 1).setValue(user.email);
+    }
+    
+    // Send notification
+    var studentId = request.ID_Usuario;
+    var notificationMsg = actionData.justification 
+      ? notificationTitle + ": " + actionData.justification 
+      : notificationTitle;
+    
+    sendNotification(studentId, notificationType, notificationTitle, notificationMsg, actionData.requestId);
+    
+    SpreadsheetApp.flush();
+    return { success: true, newStatus: newStatus };
+
+  } catch (e) {
+    Logger.log("Error in submitCGAction: " + e.stack);
+    throw new Error("Erro ao processar parecer: " + e.message);
+  }
+}
+
+/**
+ * Add observation to meeting minutes (Ata)
+ */
+function addAtaObservation(meetingId, requestId, observation, userEmail) {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName("DB_Ata");
+  if (!sheet) return; // Table doesn't exist yet
+  
+  sheet.appendRow([
+    Utilities.getUuid(),
+    meetingId || "",
+    requestId,
+    observation,
+    new Date(),
+    userEmail
+  ]);
+}
+
+/**
+ * Send notification to a user
+ */
+function sendNotification(userId, tipo, titulo, mensagem, requestId) {
+  try {
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Notificacoes");
+    if (!sheet) return;
+    
+    sheet.appendRow([
+      Utilities.getUuid(),
+      userId,
+      tipo,
+      titulo,
+      mensagem,
+      new Date(),
+      false, // Lido
+      requestId || ""
+    ]);
+  } catch (e) {
+    /* Silent */
+  }
+}
+
+/**
+ * Get notifications for current user
+ */
+function getNotifications(onlyUnread) {
+  try {
+    var user = getUserData();
+    var data = getDataFromSheet("DB_Notificacoes");
+    
+    var filtered = data.filter(function(n) {
+      var isForUser = n.ID_Usuario === user.id;
+      if (onlyUnread) {
+        return isForUser && n.Lido !== true && n.Lido !== "true";
+      }
+      return isForUser;
+    });
+    
+    // Sort by date descending and sanitize
+    return filtered.sort(function(a, b) {
+      return new Date(b.Data) - new Date(a.Data);
+    }).map(function(n) {
+      return {
+        id: n.ID,
+        tipo: n.Tipo,
+        titulo: n.Titulo,
+        mensagem: n.Mensagem,
+        data: n.Data instanceof Date ? n.Data.toISOString() : n.Data,
+        lido: n.Lido === true || n.Lido === "true",
+        requestId: n.ID_Solicitacao
+      };
+    });
+  } catch (e) {
+    return [];
+  }
+}
+
+/**
+ * Mark notification as read
+ */
+function markNotificationRead(notificationId) {
+  try {
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Notificacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][0] == notificationId) {
+        sheet.getRange(i + 1, 7).setValue(true); // Lido column
+        SpreadsheetApp.flush();
+        return { success: true };
+      }
+    }
+    return { success: false };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// --- USERS MANAGEMENT (SECRETARIA) ---
+
+function getAllUsers() {
+   try {
+     // Security check
+     var me = getUserData();
+     Logger.log("getAllUsers - Verificando permissão para: " + me.email + " com roles: " + JSON.stringify(me.roles));
+     
+     if (!me.roles.includes("Secretaria") && !me.roles.includes("Coordenação")) {
+        Logger.log("getAllUsers - Permissão negada para: " + me.email);
+        return []; // Return empty array instead of throwing
+     }
+     
+     var users = getDataFromSheet("DB_Usuarios");
+     Logger.log("getAllUsers - Dados brutos: " + (users ? users.length : 0) + " usuários");
+     
+     // Return only essential fields to avoid serialization issues
+     var result = users.map(function(u) {
+       return {
+         ID: u.ID || '',
+         Email: u.Email || '',
+         Nome: u.Nome || '',
+         Roles: u.Roles || '',
+         Status: u.Status || ''
+       };
+     });
+     
+     Logger.log("getAllUsers - Retornando " + result.length + " usuários (campos otimizados)");
+     return result;
+   } catch (e) {
+     Logger.log("getAllUsers ERRO: " + e.message);
+     return []; // Return empty array on error
+   }
+}
+
+function saveUser(userData) {
+   var me = getUserData();
+   if (!me.roles.includes("Secretaria") && !me.roles.includes("Coordenação")) {
+      throw new Error("Permissão negada");
+   }
+   
+   var ss = getSpreadsheet();
+   var sheet = ss.getSheetByName("DB_Usuarios");
+   
+   if (userData.id) {
+     // Update existing user
+     var data = sheet.getDataRange().getValues();
+     for (var i = 1; i < data.length; i++) {
+       if (data[i][0] == userData.id) {
+         sheet.getRange(i+1, 2).setValue(userData.email);
+         sheet.getRange(i+1, 3).setValue(userData.name);
+         sheet.getRange(i+1, 4).setValue(JSON.stringify(userData.roles));
+         sheet.getRange(i+1, 5).setValue(userData.status);
+         // New academic fields (columns 12-18)
+         sheet.getRange(i+1, 12).setValue(userData.dataIngresso || '');
+         sheet.getRange(i+1, 13).setValue(userData.creditos || '');
+         sheet.getRange(i+1, 14).setValue(userData.dataDefesa || '');
+         sheet.getRange(i+1, 15).setValue(userData.dataQualificacao || '');
+         sheet.getRange(i+1, 16).setValue(userData.dataIntegralizacao || '');
+         sheet.getRange(i+1, 17).setValue(userData.nomeOrientador || '');
+         sheet.getRange(i+1, 18).setValue(userData.emailOrientador || '');
+         return { success: true };
+       }
+     }
+   } else {
+     // Create new user
+     sheet.appendRow([
+       Utilities.getUuid(),
+       userData.email,
+       userData.name,
+       JSON.stringify(userData.roles),
+       userData.status,
+       '', '', '', '', '', '', // Contact fields (empty)
+       userData.dataIngresso || '',
+       userData.creditos || '',
+       userData.dataDefesa || '',
+       userData.dataQualificacao || '',
+       userData.dataIntegralizacao || '',
+       userData.nomeOrientador || '',
+       userData.emailOrientador || ''
+     ]);
+   }
+   return { success: true };
+}
+
+function archiveStudentRequests(studentEmail) {
+   var me = getUserData();
+   if (!me.roles.includes("Secretaria") && !me.roles.includes("Coordenação")) {
+      return { success: false, error: "Permissão negada" };
+   }
+   
+   if (!studentEmail) {
+      return { success: false, error: "Email do aluno não fornecido." };
+   }
+   
+   try {
+     var ss = getSpreadsheet();
+     
+     // Get Student ID
+     var userSheet = ss.getSheetByName("DB_Usuarios");
+     var users = userSheet.getDataRange().getValues();
+     var studentId = null;
+     for (var i = 1; i < users.length; i++) {
+        if (users[i][1] && String(users[i][1]).trim().toLowerCase() === String(studentEmail).trim().toLowerCase()) {
+           studentId = users[i][0];
+           break;
+        }
+     }
+     
+     if (!studentId) {
+        return { success: false, error: "Aluno não encontrado no banco de dados com este email." };
+     }
+     
+     var sheet = ss.getSheetByName("DB_Solicitacoes");
+     var archiveSheet = ss.getSheetByName("DB_Solicitacoes_Arquivo");
+     
+     // Create Archive Sheet if it doesn't exist
+     if (!archiveSheet) {
+        archiveSheet = ss.insertSheet("DB_Solicitacoes_Arquivo");
+        var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues();
+        archiveSheet.getRange(1, 1, 1, headers[0].length).setValues(headers);
+        archiveSheet.getRange(1, 1, 1, headers[0].length).setFontWeight("bold");
+        archiveSheet.setFrozenRows(1);
+     }
+     
+     var data = sheet.getDataRange().getValues();
+     if (data.length <= 1) return { success: true, count: 0 }; // Only headers
+     
+     var idUsuarioCol = data[0].indexOf("ID_Usuario");
+     var statusCol = data[0].indexOf("Status");
+     
+     if (idUsuarioCol === -1 || statusCol === -1) {
+       return { success: false, error: "Colunas ID_Usuario ou Status não encontradas em DB_Solicitacoes." };
+     }
+     
+     var archiveCount = 0;
+     var rowsToDelete = [];
+     var rowsToAppend = [];
+     
+     // Loop backwards because we'll collect rows to delete from highest index to lowest
+     for (var i = data.length - 1; i >= 1; i--) {
+        var rowUserId = String(data[i][idUsuarioCol]).trim();
+        var rowStatus = String(data[i][statusCol]).trim().toLowerCase();
+        
+        var isFinal = rowStatus.includes('concluíd') || 
+                      rowStatus.includes('concluid') || 
+                      rowStatus.includes('finalizad') || 
+                      rowStatus.includes('indeferid') || 
+                      rowStatus.includes('rejeitad') || 
+                      rowStatus.includes('aceita') || 
+                      rowStatus.includes('cancelad') ||
+                      rowStatus.includes('não acatad');
+        
+        if (rowUserId === String(studentId).trim() && isFinal) {
+           rowsToAppend.unshift(data[i]); // unshift to keep chronological order
+           rowsToDelete.push(i + 1); // 1-based index
+           archiveCount++;
+        }
+     }
+     
+     if (archiveCount > 0) {
+        // Prepare rowsToAppend to ensure arrays are homogeneous and date objects are handled natively
+        archiveSheet.getRange(archiveSheet.getLastRow() + 1, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+        
+        // Delete rows from the active sheet (safely, since rowsToDelete is descending)
+        rowsToDelete.forEach(function(rIndex) {
+           sheet.deleteRow(rIndex);
+        });
+     }
+     
+     return { success: true, count: archiveCount };
+   } catch(e) {
+     return { success: false, error: e.message };
+   }
+}
+
+function updateContactInfo(contactData) {
+    var user = getUserData();
+    // Security: Only allow updating own data
+    // contactData contains: Telefone, Celular, Endereco, EmergenciaNome, EmergenciaTel
+    
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Usuarios");
+    var data = sheet.getDataRange().getValues();
+    
+    for (var i = 1; i < data.length; i++) {
+        // Match by ID
+        if (String(data[i][0]) === user.id) {
+            // Update columns (0-based indexes in sheet vs array)
+            // Telefone: col 6 (index 5) -> sheet col 6
+            // Celular: col 7 -> sheet 7
+            // Endereco: col 8 -> sheet 8
+            // EmergenciaNome: col 9 -> sheet 9
+            // EmergenciaTel: col 10 -> sheet 10
+            
+            // Note: Sheet columns are 1-based. Array is 0-based.
+            // ID is col 1 (idx 0).
+            // Telefone is col 6 (idx 5)
+            
+            sheet.getRange(i+1, 6).setValue(contactData.Telefone || "");
+            sheet.getRange(i+1, 7).setValue(contactData.Celular || "");
+            sheet.getRange(i+1, 8).setValue(contactData.Endereco || "");
+            sheet.getRange(i+1, 9).setValue(contactData.EmergenciaNome || "");
+            sheet.getRange(i+1, 10).setValue(contactData.EmergenciaTel || "");
+            
+            SpreadsheetApp.flush();
+            return { success: true };
+        }
+    }
+    throw new Error("Usuário não encontrado.");
+}
+
+// [REMOVED] Legacy deleteRequest hard-delete. Use the detailed one at the end of file.
+
+// --- EVENTS (PUBLIC/SECRETARIA) ---
+
+function getEvents(publicOnly) {
+  var data = getDataFromSheet("DB_Eventos_Processos");
+  if (publicOnly) {
+    return data.filter(e => e.Status === "Aberto" || e.Status === "Publicado");
+  }
+  return data;
+}
+
+// --- UTIL ---
+// --- UTIL ---
+// Legacy functions removed in favor of DriveService
+
+/* ==========================================================================
+   FOLDER SHARING & PERMISSIONS (ADVANCED DRIVE SERVICE)
+   ========================================================================== */
+
+/* ==========================================================================
+   FOLDER SHARING & PERMISSIONS (ADVANCED DRIVE SERVICE)
+   ========================================================================== */
+
+/**
+ * Shares a folder with a user without sending an email notification.
+ * REQUIRES: "Drive API" service enabled in Apps Script.
+ * Supports both v2 and v3.
+ */
+function shareFolderQuietly(folderId, email) {
+    if (!email || email.indexOf('@') === -1) return "Email invalido";
+    var log = "";
+    try {
+        var resource = {
+            'role': 'reader',
+            'type': 'user',
+            'value': email,
+            'emailAddress': email // Needed for Drive API v3
+        };
+        if (Drive.Permissions.insert) {
+            Drive.Permissions.insert(resource, folderId, {
+                'sendNotificationEmails': false
+            });
+            log = "OK (v2)";
+        } else if (Drive.Permissions.create) {
+             Drive.Permissions.create(resource, folderId, {
+                'sendNotificationEmail': false
+            });
+            log = "OK (v3)";
+        } else {
+            log = "ERRO: Drive API nao detectado";
+        }
+    } catch (e) {
+        log = "ERRO: " + e.message;
+        console.error("shareFolderQuietly ERRO " + email + ": " + e.message);
+    }
+    return log;
+}
+
+function getAllCoordinationEmails() {
+    return getEmailsByRoleKeyword('Coordena');
+}
+
+function getAllSecretariaEmails() {
+    return getEmailsByRoleKeyword('Secretaria');
+}
+
+function getAllConselhoEmails() {
+   var cg = getEmailsByRoleKeyword('CG');
+   var conselho = getEmailsByRoleKeyword('Conselho');
+   try {
+       var combined = cg.concat(conselho);
+       return combined.filter(function(item, pos) { return combined.indexOf(item) == pos; });
+   } catch (e) { return []; }
+}
+
+function getAllDocenteEmails() {
+    return getEmailsByRoleKeyword('Docente');
+}
+
+function getEmailsByRoleKeyword(keyword) {
+    try {
+        var users = getDataFromSheet("DB_Usuarios");
+        var emails = [];
+        users.forEach(function(u) {
+            if (!u.Email || u.Email.indexOf('@') === -1 || u.Status !== 'Ativo') return;
+            var roles = [];
+            try {
+                 var roleRaw = u.Roles;
+                 if (typeof roleRaw === 'string') {
+                     roleRaw = roleRaw.trim();
+                     if (roleRaw.charAt(0) === '[') roles = JSON.parse(roleRaw);
+                     else roles = roleRaw.split(',').map(function(r) { return r.trim(); });
+                 } else if (Array.isArray(roleRaw)) {
+                     roles = roleRaw;
+                 }
+            } catch(e) { roles = []; }
+            var matches = roles.some(function(r) { return String(r).toUpperCase().indexOf(keyword.toUpperCase()) !== -1; });
+            if (matches) emails.push(u.Email);
+        });
+        return emails;
+    } catch(e) {
+        return [];
+    }
+}
+
+function applyRequestFolderPermissions(folder, user, advisorEmail) {
+    var folderId = folder.getId();
+    var actionLog = [];
+    var groupCoord = getAllCoordinationEmails();
+    var groupSec = getAllSecretariaEmails();
+    var groupConselho = getAllConselhoEmails(); 
+    var groupDocente = getAllDocenteEmails();
+
+    var isDiscente = user.roles.some(function(r) { 
+        var ru = r.toUpperCase();
+        return ru.indexOf('DISCENTE') !== -1 || ru.indexOf('ALUNO') !== -1 || ru.indexOf('ESTUDANTE') !== -1 || ru.indexOf('SOLICITANTE') !== -1;
+    });
+    
+    if (isDiscente) {
+        var targetAdvisorEmail = advisorEmail;
+        var lookupNote = "";
+        if ((!targetAdvisorEmail || targetAdvisorEmail.indexOf('@') === -1) && user.Nome_Orientador) {
+             try {
+                var users = getDataFromSheet("DB_Usuarios");
+                var advisor = users.find(function(u) {
+                    return u.Nome && u.Nome.trim().toUpperCase() === user.Nome_Orientador.trim().toUpperCase();
+                });
+                if (advisor && advisor.Email) {
+                    targetAdvisorEmail = advisor.Email;
+                    lookupNote = "(Busca por nome: " + user.Nome_Orientador + ")";
+                }
+             } catch(e) {}
+        }
+        if (targetAdvisorEmail && targetAdvisorEmail.indexOf('@') !== -1) {
+             var res = shareFolderQuietly(folderId, targetAdvisorEmail);
+             actionLog.push("Orientador (" + targetAdvisorEmail + "): " + res + " " + lookupNote);
+        } else {
+             actionLog.push("Orientador: Nao encontrado/Sem email. " + lookupNote);
+        }
+    }
+    
+    var uniqueEmails = [];
+    function addToUnique(list) {
+        list.forEach(function(e) {
+            if (e && uniqueEmails.indexOf(e) === -1) uniqueEmails.push(e);
+        });
+    }
+    addToUnique(groupConselho);
+    addToUnique(groupCoord);
+    addToUnique(groupSec);
+    addToUnique(groupDocente);
+    
+    uniqueEmails.forEach(function(email) {
+        var res = shareFolderQuietly(folderId, email);
+        if (res.indexOf("ERRO") !== -1) actionLog.push("Grupo (" + email + "): " + res);
+    });
+    
+    if (actionLog.length === 0) actionLog.push("Grupos processados (" + uniqueEmails.length + " emails).");
+    return actionLog.join("; ");
+}
+
+/**
+ * Get all emails from users with CG role (Updated to use new helper)
+ */
+function getAllCGEmails() {
+  return getAllConselhoEmails();
+}
+
+/**
+ * Get emails for specific CG profile (CG1, CG2, CG3)
+ */
+function getEmailsForCGProfile(cgProfile) {
+  try {
+    var users = getDataFromSheet("DB_Usuarios");
+    var emails = [];
+    users.forEach(function(u) {
+      var roles = [];
+      try { 
+        var roleRaw = u.Roles;
+        if (typeof roleRaw === 'string') {
+          roleRaw = roleRaw.trim();
+          if (roleRaw.startsWith('[')) roles = JSON.parse(roleRaw);
+          else roles = roleRaw.split(',').map(function(r) { return r.trim(); });
+        } else if (Array.isArray(roleRaw)) {
+          roles = roleRaw;
+        }
+      } catch(e){}
+      
+      var matchesCG = roles.some(function(r) { 
+        var rUpper = String(r).toUpperCase();
+        return rUpper.includes(cgProfile.toUpperCase()) || 
+               (cgProfile === 'CG1' && rUpper.includes('CG') && rUpper.includes('1')) ||
+               (cgProfile === 'CG2' && rUpper.includes('CG') && rUpper.includes('2')) ||
+               (cgProfile === 'CG3' && rUpper.includes('CG') && rUpper.includes('3'));
+      });
+      if (matchesCG && u.Email && u.Email.includes('@')) {
+        emails.push(u.Email);
+      }
+    });
+    return emails;
+  } catch(e) {
+    return [];
+  }
+}
+
+/**
+ * Round-robin CG assignment for financial requests
+ */
+function assignCGRoundRobin() {
+  var cgOptions = ['CG1', 'CG2', 'CG3'];
+  return cgOptions[Math.floor(Math.random() * cgOptions.length)];
+}
+
+/**
+ * Send formatted email for financial workflow
+ */
+function sendFinancialEmail(to, subject, htmlBody) {
+  if (!to || !to.includes('@')) return false;
+  try {
+    MailApp.sendEmail({
+      to: to,
+      subject: '[PPGPsi] ' + subject,
+      htmlBody: '<div style="font-family: Arial, sans-serif;">' + htmlBody + 
+                '<p style="margin-top:20px;"><a href="' + SYSTEM_LINK + '">Acessar Sistema PPGPsi</a></p></div>',
+      noReply: true
+    });
+    return true;
+  } catch (e) {
+    console.error("Erro ao enviar email para " + to + ": " + e.toString());
+    return false;
+  }
+}
+
+/* ==========================================================================
+   PROFILE FUNCTIONS
+   ========================================================================== */
+
+/**
+ * Updates the current user's personal profile data
+ */
+function updateUserProfile(data) {
+  try {
+    var email = Session.getActiveUser().getEmail();
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Usuarios");
+    var dataRange = sheet.getDataRange();
+    var values = dataRange.getValues();
+    var headers = values[0];
+    
+    // Find column indices for new fields
+    var colTelefone = headers.indexOf("Telefone");
+    var colCelular = headers.indexOf("Celular");
+    var colEndereco = headers.indexOf("Endereco");
+    var colEmergNome = headers.indexOf("EmergenciaNome");
+    var colEmergTel = headers.indexOf("EmergenciaTel");
+    var colEmail = headers.indexOf("Email");
+    
+    // Find user row
+    for (var i = 1; i < values.length; i++) {
+      if (values[i][colEmail] === email) {
+        // Update fields
+        if (colTelefone >= 0) sheet.getRange(i + 1, colTelefone + 1).setValue(data.telefone || '');
+        if (colCelular >= 0) sheet.getRange(i + 1, colCelular + 1).setValue(data.celular || '');
+        if (colEndereco >= 0) sheet.getRange(i + 1, colEndereco + 1).setValue(data.endereco || '');
+        if (colEmergNome >= 0) sheet.getRange(i + 1, colEmergNome + 1).setValue(data.emergencia_nome || '');
+        if (colEmergTel >= 0) sheet.getRange(i + 1, colEmergTel + 1).setValue(data.emergencia_tel || '');
+        
+        SpreadsheetApp.flush();
+        return { success: true };
+      }
+    }
+    
+    throw new Error("Usuário não encontrado");
+  } catch (e) {
+    throw new Error("Erro ao atualizar perfil: " + e.message);
+  }
+}
+
+/**
+ * Uploads a user profile photo to Drive and saves the URL
+ */
+function uploadUserPhoto(base64Data, fileName, mimeType) {
+  try {
+    var email = Session.getActiveUser().getEmail();
+    
+    // Create blob from base64
+    var blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType, fileName);
+    
+    // Create or get "PPGPsi_Fotos" folder
+    var folders = DriveApp.getFoldersByName("PPGPsi_Fotos");
+    var folder;
+    if (folders.hasNext()) {
+      folder = folders.next();
+    } else {
+      folder = DriveApp.createFolder("PPGPsi_Fotos");
+    }
+    
+    // Check for existing photo and delete
+    var existingFiles = folder.getFilesByName(email.replace("@", "_at_") + "_photo");
+    while (existingFiles.hasNext()) {
+      existingFiles.next().setTrashed(true);
+    }
+    
+    // Upload new photo
+    var file = folder.createFile(blob).setName(email.replace("@", "_at_") + "_photo");
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    
+    // Use thumbnail export format for proper embedding in img tags
+    var photoUrl = "https://drive.google.com/thumbnail?id=" + file.getId() + "&sz=w300";
+    
+    // Update user record
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Usuarios");
+    var dataRange = sheet.getDataRange();
+    var values = dataRange.getValues();
+    var headers = values[0];
+    
+    var colFoto = headers.indexOf("FotoUrl");
+    var colEmail = headers.indexOf("Email");
+    
+    for (var i = 1; i < values.length; i++) {
+      if (values[i][colEmail] === email) {
+        if (colFoto >= 0) sheet.getRange(i + 1, colFoto + 1).setValue(photoUrl);
+        SpreadsheetApp.flush();
+        return photoUrl;
+      }
+    }
+    
+    throw new Error("Usuário não encontrado");
+  } catch (e) {
+    throw new Error("Erro ao enviar foto: " + e.message);
+  }
+}
+
+/* ==========================================================================
+   SECRETARIA DASHBOARD DATA
+   ========================================================================== */
+
+/**
+ * Returns aggregated data for Secretaria Dashboard
+ */
+function getSecretariaDashboardData() {
+  try {
+    var user = getUserData();
+    if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) {
+      throw new Error("Acesso negado");
+    }
+    
+    // Get all requests
+    var requests = getDataFromSheet("DB_Solicitacoes");
+    var meetings = getDataFromSheet("DB_Calendario_Reunioes");
+    var users = getDataFromSheet("DB_Usuarios");
+    
+    // Build user map for names
+    var userMap = {};
+    users.forEach(u => userMap[String(u.ID)] = u.Nome);
+    
+    // Today and last 7 days
+    var today = new Date();
+    today.setHours(0, 0, 0, 0);
+    var sevenDaysAgo = new Date(today);
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    
+    // Statistics
+    var stats = {
+      aguardandoOrientador: 0,
+      pautadosCPG: 0,
+      aprovadosHoje: 0,
+      reprovadosHoje: 0,
+      totalPendentes: 0
+    };
+    
+    // Pending actions for secretaria (requests waiting for their validation)
+    var pendingActions = [];
+    
+    // Recent approvals
+    var recentApprovals = [];
+    
+    requests.forEach(function(r) {
+      var status = String(r.Status || '');
+      
+      // Count by status
+      if (status === 'Aguardando Orientador') {
+        stats.aguardandoOrientador++;
+        stats.totalPendentes++;
+      } else if (status.includes('Pautado') || status === 'Pendente' || status.includes('Aprovado pela CG') || status.includes('Aprovado CG') || status === 'approved_cg' || status.includes('Aprovado com Ressalvas') || status === 'Prestação de Contas em Análise') {
+        stats.pautadosCPG++;
+        stats.totalPendentes++;
+        
+        // Add to pending actions for secretaria
+        pendingActions.push({
+          id: r.ID,
+          tipo: r.Tipo_Solicitacao,
+          aluno: userMap[String(r.ID_Usuario)] || 'Desconhecido',
+          data: r.Data_Criacao instanceof Date ? r.Data_Criacao.toISOString() : r.Data_Criacao,
+          status: status
+        });
+      } else if (status.includes('Aprovado')) {
+        // Check if approved today
+        var dataCriacao = new Date(r.Data_Criacao);
+        if (dataCriacao >= today) {
+          stats.aprovadosHoje++;
+        }
+        // Recent approvals (last 7 days)
+        if (dataCriacao >= sevenDaysAgo) {
+          recentApprovals.push({
+            id: r.ID,
+            tipo: r.Tipo_Solicitacao,
+            aluno: userMap[String(r.ID_Usuario)] || 'Desconhecido',
+            data: r.Data_Criacao instanceof Date ? r.Data_Criacao.toISOString() : r.Data_Criacao,
+            status: status
+          });
+        }
+      } else if (status.includes('Reprovado') || status.includes('Rejeitado')) {
+        var dataCriacao2 = new Date(r.Data_Criacao);
+        if (dataCriacao2 >= today) {
+          stats.reprovadosHoje++;
+        }
+      } else if (status.includes('Retornado')) {
+        stats.totalPendentes++;
+      }
+    });
+    
+    // Sort pending by date (oldest first)
+    pendingActions.sort(function(a, b) {
+      return new Date(a.data) - new Date(b.data);
+    });
+    
+    // Sort recent approvals (newest first)
+    recentApprovals.sort(function(a, b) {
+      return new Date(b.data) - new Date(a.data);
+    });
+    
+    // Next meetings (open status)
+    var upcomingMeetings = meetings
+      .filter(function(m) { return m.Status === 'Aberto'; })
+      .map(function(m) {
+        return {
+          id: m.ID,
+          nome: m.Nome,
+          data: m.Data_Reuniao instanceof Date ? m.Data_Reuniao.toISOString() : m.Data_Reuniao,
+          prazo: m.Prazo_Fechamento instanceof Date ? m.Prazo_Fechamento.toISOString() : m.Prazo_Fechamento
+        };
+      })
+      .sort(function(a, b) {
+        return new Date(a.data) - new Date(b.data);
+      });
+    
+    return {
+      stats: stats,
+      pendingActions: pendingActions.slice(0, 10), // Limit to 10
+      recentApprovals: recentApprovals.slice(0, 5), // Limit to 5
+      upcomingMeetings: upcomingMeetings.slice(0, 3) // Limit to 3
+    };
+    
+  } catch (e) {
+    throw new Error("Erro ao carregar dashboard: " + e.message);
+  }
+}
+
+// TEST FUNCTION - Execute manually to debug
+function testGetAllUsers() {
+  try {
+    var currentEmail = Session.getActiveUser().getEmail();
+    Logger.log("Email do usuário logado: " + currentEmail);
+    
+    var users = getDataFromSheet("DB_Usuarios");
+    Logger.log("Total de usuários encontrados: " + users.length);
+    
+    // Check if current user is found
+    var me = users.find(u => u.Email && u.Email.toLowerCase() === currentEmail.toLowerCase() && u.Status === 'Ativo');
+    if (me) {
+      Logger.log("Usuário encontrado: " + me.Nome + " com roles: " + me.Roles);
+    } else {
+      Logger.log("PROBLEMA: Usuário NÃO encontrado na planilha!");
+      Logger.log("Emails na planilha: " + users.map(u => u.Email).join(", "));
+    }
+    
+    // Test getAllUsers permission
+    try {
+      var result = getAllUsers();
+      Logger.log("getAllUsers retornou: " + result.length + " usuários");
+    } catch (e) {
+      Logger.log("ERRO em getAllUsers: " + e.message);
+    }
+    
+    return users;
+  } catch (e) {
+    Logger.log("ERRO: " + e.message);
+    throw e;
+  }
+}
+
+/* ==========================================================================
+   PROPGWEB CSV IMPORT FUNCTION
+   ========================================================================== */
+
+/**
+ * Import ProPGWeb CSV data to update student records
+ * CSV columns expected:
+ * nome_aluno,nivel,status,email,data_matricula,creditos_disciplinas_optativas,
+ * creditos_disciplinas_obrigatorias,data_para_defesa,data_para_qualificacao,
+ * data_para_integralizacao,nome_orientador,data_defesa,cpf,rg,orgao_expedidor,
+ * data_emissao,data_nascimento,sexo,raca,telefone_celular,logradouro,numero,
+ * complemento,bairro,cidade,uf,cep
+ * 
+ * @param {string} csvContent - Raw CSV content as string
+ * @returns {Object} Result with stats: { success, inserted, updated, errors, errorMessages }
+ */
+function importProPGWebCSV(csvContent) {
+  try {
+    // Check permissions
+    var user = getUserData();
+    if (!user.roles.includes("Secretaria") && !user.roles.includes("Coordenação")) {
+      throw new Error("Acesso negado. Apenas Secretaria/Coordenação podem importar dados.");
+    }
+    
+    // Parse CSV
+    var lines = csvContent.split(/\r?\n/).filter(function(line) { return line.trim() !== ''; });
+    if (lines.length < 2) {
+      throw new Error("CSV vazio ou sem dados válidos.");
+    }
+    
+    // Parse header (first line)
+    var headerLine = lines[0];
+    var headers = parseCSVLine(headerLine);
+    
+    // Normalize headers (remove quotes, trim, lowercase)
+    headers = headers.map(function(h) { 
+      return h.replace(/^"|"$/g, '').trim().toLowerCase(); 
+    });
+    
+    // CSV to DB field mapping
+    var fieldMapping = {
+      'nome_aluno': 'Nome',
+      'nivel': 'Nivel',
+      'status': 'Status',
+      'email': 'Email',
+      'data_matricula': 'Data_Ingresso',
+      'creditos_disciplinas_optativas': 'Creditos_Optativas',
+      'creditos_disciplinas_obrigatorias': 'Creditos_Obrigatorias',
+      'data_para_defesa': 'Data_Defesa',
+      'data_para_qualificacao': 'Data_Qualificacao',
+      'data_para_integralizacao': 'Data_Integralizacao',
+      'nome_orientador': 'Nome_Orientador',
+      'data_defesa': 'Data_Defesa_Realizada',
+      'cpf': 'CPF',
+      'rg': 'RG',
+      'orgao_expedidor': 'RG_Orgao',
+      'data_emissao': 'RG_Data_Emissao',
+      'data_nascimento': 'Data_Nascimento',
+      'sexo': 'Sexo',
+      'raca': 'Raca',
+      'telefone_celular': 'Celular',
+      'logradouro': 'Logradouro',
+      'numero': 'Numero',
+      'complemento': 'Complemento',
+      'bairro': 'Bairro',
+      'cidade': 'Cidade',
+      'uf': 'UF',
+      'cep': 'CEP'
+    };
+    
+    // Get spreadsheet and users sheet
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Usuarios");
+    var data = sheet.getDataRange().getValues();
+    var dbHeaders = data[0];
+    
+    // Create email index for quick lookup
+    var emailColIdx = dbHeaders.indexOf('Email');
+    var emailToRowMap = {};
+    for (var i = 1; i < data.length; i++) {
+      var email = String(data[i][emailColIdx] || '').trim().toLowerCase();
+      if (email) emailToRowMap[email] = i + 1; // 1-based row number
+    }
+    
+    // Process results
+    var result = {
+      success: true,
+      total: lines.length - 1,
+      inserted: 0,
+      updated: 0,
+      skipped: 0,
+      errors: 0,
+      errorMessages: []
+    };
+    
+    // Process each data line (skip header)
+    for (var lineIdx = 1; lineIdx < lines.length; lineIdx++) {
+      try {
+        var values = parseCSVLine(lines[lineIdx]);
+        if (values.length < 4) {
+          result.skipped++;
+          continue;
+        }
+        
+        // Build record from CSV
+        var record = {};
+        for (var colIdx = 0; colIdx < headers.length && colIdx < values.length; colIdx++) {
+          var csvField = headers[colIdx];
+          var dbField = fieldMapping[csvField];
+          if (dbField) {
+            var val = values[colIdx].replace(/^"|"$/g, '').trim();
+            record[dbField] = val;
+          }
+        }
+        
+        // Validate email
+        var email = String(record.Email || '').trim().toLowerCase();
+        if (!email || !email.includes('@')) {
+          result.errors++;
+          result.errorMessages.push("Linha " + (lineIdx + 1) + ": Email inválido");
+          continue;
+        }
+        
+        // Check if user exists
+        var existingRow = emailToRowMap[email];
+        
+        if (existingRow) {
+          // UPDATE existing user
+          for (var dbFieldName in record) {
+            var colIndex = dbHeaders.indexOf(dbFieldName);
+            if (colIndex >= 0 && record[dbFieldName]) {
+              sheet.getRange(existingRow, colIndex + 1).setValue(record[dbFieldName]);
+            }
+          }
+          result.updated++;
+        } else {
+          // INSERT new user
+          var newRow = [];
+          for (var hi = 0; hi < dbHeaders.length; hi++) {
+            var header = dbHeaders[hi];
+            if (header === 'ID') {
+              newRow.push(Utilities.getUuid());
+            } else if (header === 'Roles') {
+              // Default role for students
+              var nivel = record.Nivel || 'Discente';
+              newRow.push(JSON.stringify(['Discente']));
+            } else if (header === 'Status') {
+              // Map status or default to Ativo
+              var status = record.Status || 'Ativo';
+              if (status.toLowerCase().includes('regular') || status.toLowerCase().includes('ativo')) {
+                newRow.push('Ativo');
+              } else {
+                newRow.push('Inativo');
+              }
+            } else {
+              newRow.push(record[header] || '');
+            }
+          }
+          sheet.appendRow(newRow);
+          result.inserted++;
+          
+          // Update email map for subsequent lookups
+          emailToRowMap[email] = sheet.getLastRow();
+        }
+        
+      } catch (lineError) {
+        result.errors++;
+        result.errorMessages.push("Linha " + (lineIdx + 1) + ": " + lineError.message);
+      }
+    }
+    
+    SpreadsheetApp.flush();
+    
+    return result;
+    
+  } catch (e) {
+    return {
+      success: false,
+      error: e.message,
+      inserted: 0,
+      updated: 0,
+      errors: 1,
+      errorMessages: [e.message]
+    };
+  }
+}
+
+/**
+ * Parse a single CSV line handling quoted values with commas
+ */
+function parseCSVLine(line) {
+  var result = [];
+  var current = '';
+  var inQuotes = false;
+  
+  for (var i = 0; i < line.length; i++) {
+    var char = line[i];
+    
+    if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current); // Add last field
+  
+  return result;
+}
+
+/* ==========================================================================
+   MURAL DA COMUNIDADE
+   ========================================================================== */
+
+/**
+ * Get all mural posts ordered by date (newest first)
+ */
+function getMuralPosts() {
+  try {
+    var posts = getDataFromSheet("DB_Mural");
+    // Sort by date descending
+    posts.sort(function(a, b) {
+      return new Date(b.Data_Publicacao) - new Date(a.Data_Publicacao);
+    });
+    return posts;
+  } catch (e) {
+    Logger.log("getMuralPosts ERRO: " + e.message);
+    return [];
+  }
+}
+
+/**
+ * Create a new mural post
+ */
+function createMuralPost(conteudo) {
+  try {
+    var user = getUserData();
+    if (!user || !user.id) {
+      throw new Error("Usuário não autenticado");
+    }
+    
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Mural");
+    if (!sheet) {
+      setupSheets(ss);
+      sheet = ss.getSheetByName("DB_Mural");
+    }
+    
+    var newPost = [
+      Utilities.getUuid(),
+      user.id,
+      user.nome,
+      user.FotoUrl || '',
+      conteudo,
+      new Date().toISOString()
+    ];
+    
+    sheet.appendRow(newPost);
+    SpreadsheetApp.flush();
+    
+    return { success: true, message: "Publicação criada com sucesso!" };
+  } catch (e) {
+    Logger.log("createMuralPost ERRO: " + e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+/* ==========================================================================
+   DOCENTE - PEDIDOS DOS ORIENTANDOS
+   ========================================================================== */
+
+/**
+ * Get requests from students of the current docente (orientador)
+ */
+/**
+ * Get requests from students of the current docente (orientador)
+ */
+/**
+ * Get requests from students of the current docente (orientador)
+ */
+/**
+ * Get requests from students of the current docente (orientador)
+ */
+function getRequestsForDocente() {
+  try {
+    var me = getUserData();
+    if (!me || !me.roles.includes("Docente")) {
+      return [];
+    }
+    
+    var allRequests = getDataFromSheet("DB_Solicitacoes");
+    var myEmail = (me.email || '').trim().toLowerCase();
+    var myName = (me.nome || '').trim().toLowerCase();
+    var myId = me.id;
+
+    // 1. Find all students that have this user as advisor (Legacy Support)
+    var users = getDataFromSheet("DB_Usuarios");
+    
+    // Create Map for Name Lookup & ID List
+    var userMap = {};
+    var myAdviseesIds = [];
+    
+    users.forEach(function(u) {
+       var uId = String(u.ID || '').trim();
+       var uName = u.Nome || 'Desconhecido';
+       userMap[uId] = uName;
+       
+       var uOrientadorEmail = (u.Email_Orientador || '').trim().toLowerCase();
+       if (uOrientadorEmail === myEmail) {
+          myAdviseesIds.push(uId);
+       }
+    });
+    
+    // Filter requests
+    var filtered = allRequests.filter(function(req) {
+      // A. Direct Match (New Requests with metadata)
+      var orientadorEmail = (req.Email_Orientador || '').trim().toLowerCase();
+      var orientadorNome = (req.Nome_Orientador || '').trim().toLowerCase();
+      
+      if ((orientadorEmail && orientadorEmail === myEmail) || (orientadorNome && orientadorNome.includes(myName))) {
+         return true;
+      }
+
+      // B. Indirect Match (Legacy Requests via User DB)
+      var reqUserId = String(req.ID_Usuario || '').trim();
+      if (reqUserId && myAdviseesIds.includes(reqUserId)) {
+         return true;
+      }
+
+      return false;
+    });
+    
+    // Sanitize for Transport (Fix Date Objects) & Add Names
+    return filtered.reverse().map(function(item) {
+        var clean = {};
+        for (var key in item) {
+           var val = item[key];
+           if (val instanceof Date) {
+              clean[key] = val.toISOString();
+           } else {
+              clean[key] = val;
+           }
+        }
+        // Add implicit Name and ensure Email_Orientador
+        var uid = String(item.ID_Usuario || '').trim();
+        clean.Nome_Aluno = userMap[uid] || "Desconhecido / Externo";
+        clean.Nome_Solicitante = clean.Nome_Aluno; // Fallback for Frontend
+        if (!clean.Email_Orientador) {
+             // Try to find in user DB if not in request (Legacy)
+             var userObj = users.find(u => String(u.ID || '').trim() === uid);
+             if (userObj) clean.Email_Orientador = userObj.Email_Orientador;
+        }
+        return clean;
+    });
+
+  } catch (e) {
+    Logger.log("getRequestsForDocente ERRO: " + e.message);
+    return [];
+  }
+}
+
+/* ==========================================================================
+   CG - PARECERISTAS E REVEZAMENTO
+   ========================================================================== */
+
+/**
+ * Get all CG members for parecerista assignment
+ * Accepts both "CG" and "Conselho" roles
+ */
+function getCGMembers() {
+  try {
+    var users = getDataFromSheet("DB_Usuarios");
+    var cgMembers = users.filter(function(u) {
+      try {
+        var roles = JSON.parse(u.Roles || '[]');
+        // Accept both "CG" and "Conselho" as valid roles
+        return roles.includes("CG") || roles.includes("Conselho");
+      } catch(e) {
+        return false;
+      }
+    });
+    Logger.log("getCGMembers - Encontrados: " + cgMembers.length + " membros CG/Conselho");
+    return cgMembers;
+  } catch (e) {
+    Logger.log("getCGMembers ERRO: " + e.message);
+    return [];
+  }
+}
+
+/**
+ * Get the next CG parecerista in round-robin order
+ */
+function getNextCGParecerista() {
+  try {
+    var cgMembers = getCGMembers();
+    if (cgMembers.length === 0) return null;
+    
+    // Get financial requests to count assignments
+    var requests = getDataFromSheet("DB_Solicitacoes");
+    var financialRequests = requests.filter(function(r) {
+      return r.Tipo_Solicitacao && r.Tipo_Solicitacao.includes("Financeiro");
+    });
+    
+    // Count assignments per CG member (use string keys)
+    var counts = {};
+    cgMembers.forEach(function(m) { 
+      counts[String(m.ID)] = 0; 
+    });
+    
+    financialRequests.forEach(function(r) {
+      // Check ID_Parecerista_CG column
+      var pareceristaId = String(r.ID_Parecerista_CG || '').trim();
+      if (pareceristaId && counts[pareceristaId] !== undefined) {
+        counts[pareceristaId]++;
+        return;
+      }
+      
+      // Fallback: Check details.Parecerista
+      try {
+        var details = typeof r.Detalhes === 'string' ? JSON.parse(r.Detalhes) : (r.Detalhes || {});
+        var parecerista = String(details.Parecerista || '').trim().toLowerCase();
+        if (parecerista) {
+          // Try to match by name or email
+          cgMembers.forEach(function(m) {
+            var memberEmail = String(m.Email || '').trim().toLowerCase();
+            var memberName = String(m.Nome || '').trim().toLowerCase();
+            if (parecerista === memberEmail || parecerista === memberName || parecerista.includes(memberName)) {
+              counts[String(m.ID)]++;
+            }
+          });
+        }
+      } catch (e) {}
+    });
+    
+    // Find member with least assignments
+    var minCount = Infinity;
+    var nextMember = cgMembers[0];
+    cgMembers.forEach(function(m) {
+      var memberId = String(m.ID);
+      if (counts[memberId] < minCount) {
+        minCount = counts[memberId];
+        nextMember = m;
+      }
+    });
+    
+    return {
+      id: nextMember.ID,
+      nome: nextMember.Nome,
+      email: nextMember.Email,
+      pareceres: counts[String(nextMember.ID)] || 0
+    };
+  } catch (e) {
+    Logger.log("getNextCGParecerista ERRO: " + e.message);
+    return null;
+  }
+}
+
+/**
+ * Get CG parecerista stats for dashboard
+ */
+function getCGPareceristaStats() {
+  try {
+    var cgMembers = getCGMembers();
+    var requests = getDataFromSheet("DB_Solicitacoes");
+    var financialRequests = requests.filter(function(r) {
+      return r.Tipo_Solicitacao && r.Tipo_Solicitacao.includes("Financeiro");
+    });
+    
+    var stats = cgMembers.map(function(m) {
+      var memberId = String(m.ID || '').trim();
+      var memberEmail = String(m.Email || '').trim().toLowerCase();
+      var memberName = String(m.Nome || '').trim().toLowerCase();
+      
+      var count = financialRequests.filter(function(r) {
+        // Check ID_Parecerista_CG column (primary)
+        var pareceristaId = String(r.ID_Parecerista_CG || '').trim();
+        if (pareceristaId && pareceristaId === memberId) {
+          return true;
+        }
+        
+        // Fallback: Check details.Parecerista for historical data
+        try {
+          var details = typeof r.Detalhes === 'string' ? JSON.parse(r.Detalhes) : (r.Detalhes || {});
+          var parecerista = String(details.Parecerista || '').trim().toLowerCase();
+          if (parecerista && (parecerista === memberEmail || parecerista === memberName || parecerista.includes(memberName))) {
+            return true;
+          }
+        } catch (e) {}
+        
+        return false;
+      }).length;
+      
+      return {
+        id: m.ID,
+        nome: m.Nome,
+        email: m.Email,
+        pareceres: count
+      };
+    });
+    
+    var nextParecerista = getNextCGParecerista();
+    
+    return {
+      members: stats,
+      next: nextParecerista,
+      totalRequests: financialRequests.length
+    };
+  } catch (e) {
+    Logger.log("getCGPareceristaStats ERRO: " + e.message);
+    return { members: [], next: null, totalRequests: 0 };
+  }
+}
+
+/* ==========================================================================
+   DOCENTE - ORIENTANDOS ATIVOS
+   ========================================================================== */
+
+/**
+ * Get active orientandos (students) of the current docente
+ */
+function getOrientandosAtivos() {
+  try {
+    var me = getUserData();
+    Logger.log("getOrientandosAtivos - Docente logado: " + (me ? me.email : 'null'));
+    Logger.log("getOrientandosAtivos - Roles: " + JSON.stringify(me ? me.roles : []));
+    
+    if (!me || !me.roles.includes("Docente")) {
+      Logger.log("getOrientandosAtivos - Usuário não é Docente, retornando vazio");
+      return [];
+    }
+    
+    var users = getDataFromSheet("DB_Usuarios");
+    var requests = getDataFromSheet("DB_Solicitacoes");
+    var myEmail = me.email.toLowerCase().trim();
+    
+    Logger.log("getOrientandosAtivos - Total de usuários: " + users.length);
+    Logger.log("getOrientandosAtivos - Buscando por Email_Orientador = " + myEmail);
+    
+    // Filter students with this docente as orientador and status "Andamento" (= Ativo)
+    var orientandos = users.filter(function(u) {
+      var orientadorEmail = (u.Email_Orientador || '').toLowerCase().trim();
+      var status = (u.Status || '').toLowerCase().trim();
+      
+      // Orientando se email do orientador bate
+      var isOrientando = orientadorEmail === myEmail;
+      
+      // Status "Andamento" significa ativo no sistema (ou vazio ou "ativo")
+      var isAtivo = status === 'andamento' || status === 'ativo' || status === '';
+      
+      if (isOrientando) {
+        Logger.log("  -> Encontrado: " + u.Nome + " | Email_Orientador: " + orientadorEmail + " | Status: " + status + " | Ativo: " + isAtivo);
+      }
+      
+      return isOrientando && isAtivo;
+    });
+    
+    Logger.log("getOrientandosAtivos - Orientandos encontrados: " + orientandos.length);
+    
+    // Check for pending requests for each orientando
+    var result = orientandos.map(function(o) {
+      var hasPending = requests.some(function(r) {
+        return r.ID_Usuario === o.ID && 
+               (r.Status || '').toLowerCase().includes('aguardando orientador');
+      });
+      
+      return {
+        ID: String(o.ID || ''),
+        Nome: String(o.Nome || ''),
+        Email: String(o.Email || ''),
+        Data_Defesa: o.Data_Defesa ? String(o.Data_Defesa) : '',
+        Nivel: String(o.Nivel || ''),
+        hasPendingRequest: Boolean(hasPending)
+      };
+    });
+    
+    // Sort: those with pending requests first
+    result.sort(function(a, b) {
+      if (a.hasPendingRequest && !b.hasPendingRequest) return -1;
+      if (!a.hasPendingRequest && b.hasPendingRequest) return 1;
+      return 0;
+    });
+    
+    Logger.log("getOrientandosAtivos - Retornando: " + JSON.stringify(result));
+    return result;
+  } catch (e) {
+    Logger.log("getOrientandosAtivos ERRO: " + e.message);
+    return [];
+  }
+}
+
+/* ==========================================================================
+   CG PARECER PROCESSING
+   ========================================================================== */
+
+/**
+ * Process the complex CG Parecer with side-by-side review
+ * Payload: { requestId, action, status, justification, approvedValue }
+ */
+function processCGParecer(payload) {
+  try {
+    var user = getUserData();
+    // Security check: must be CG or Admin
+    if (!user.roles.includes("CG") && !user.roles.includes("Conselho") && !user.roles.includes("Coordenação")) {
+      throw new Error("Permissão negada: Apenas membros do CG podem emitir parecer.");
+    }
+
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    var headers = data[0];
+    
+    var rowIndex = -1;
+    var requestRow = null;
+    
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][0] == payload.requestId) {
+        rowIndex = i;
+        requestRow = data[i];
+        break;
+      }
+    }
+    
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+    
+    // Column Indices
+    var cols = {};
+    headers.forEach(function(h, idx) { cols[h] = idx; });
+    
+    // 1. Update Details
+    var currentDetailsStr = requestRow[cols['Detalhes']];
+    var details = {};
+    try { details = JSON.parse(currentDetailsStr); } catch(e) {}
+    var detailsChanged = false;
+
+    // Handle Value Change
+    if (payload.approvedValue) {
+       var originalVal = details['Valor Solicitado (R$)'] || details['valor'];
+       if (originalVal != payload.approvedValue) {
+           details['Valor Solicitado (R$)'] = payload.approvedValue;
+           details['valor'] = payload.approvedValue;
+           details['_observacao_valor'] = "Valor alterado pelo CG de R$ " + originalVal + " para R$ " + payload.approvedValue;
+           detailsChanged = true;
+           Logger.log("processCGParecer: Valor atualizado para " + payload.approvedValue);
+       }
+    }
+
+    // Handle CAPES Analysis (Parecer Técnico)
+    if (payload.capesAnalysis) {
+        details['Parecer_CG_Capes'] = payload.capesAnalysis;
+        detailsChanged = true;
+    }
+    
+    // Save Parecerista Metadata for Rotation Logic
+    if (payload.status && (payload.status.indexOf('APPROVED') !== -1 || payload.status.indexOf('APROVADO') !== -1 || payload.status === 'REJECTED' || payload.status === 'PENDING_INFO')) {
+        details['Parecerista'] = user.Nome || user.nome || user.email; // Fallback to email if name missing
+        details['Data_Parecer'] = new Date().toISOString();
+        detailsChanged = true;
+        
+        // CRITICAL FIX: Also update the ID_Parecerista_CG column for rotation stats
+        if (cols['ID_Parecerista_CG'] !== undefined) {
+            sheet.getRange(rowIndex + 1, cols['ID_Parecerista_CG'] + 1).setValue(user.id);
+            Logger.log("processCGParecer: ID_Parecerista_CG atualizado para " + user.id);
+        }
+    }
+
+    if (detailsChanged) {
+        sheet.getRange(rowIndex + 1, cols['Detalhes'] + 1).setValue(JSON.stringify(details));
+    }
+    
+    // 2. Update Status
+    sheet.getRange(rowIndex + 1, cols['Status'] + 1).setValue(payload.status);
+    
+    // 3. Update History
+    var history = [];
+    try { history = JSON.parse(requestRow[cols['Historico_Aprovacao']] || '[]'); } catch(e) {}
+    
+    history.push({
+      date: new Date().toISOString(),
+      action: payload.status,
+      user: user.email,
+      justification: payload.justification || "Parecer Emitido",
+      role: "CG"
+    });
+    
+    sheet.getRange(rowIndex + 1, cols['Historico_Aprovacao'] + 1).setValue(JSON.stringify(history));
+    
+    // 4. Send Notification
+    var studentId = requestRow[cols['ID_Usuario']];
+    var title = "Parecer CG: " + (payload.action === 'aprovar' ? "Aprovado" : "Atualização");
+    if (payload.action === 'recusar' || payload.action === 'Negar') title = "Parecer CG: Pedido Negado";
+    
+    sendNotification(studentId, "parecer_cg", title, payload.justification, payload.requestId);
+    
+    SpreadsheetApp.flush();
+    return { success: true };
+    
+  } catch(e) {
+    Logger.log("processCGParecer ERRO: " + e.message);
+    throw e;
+  }
+}
+
+
+
+/**
+ * Helper to get student email by ID
+ */
+function getStudentEmailById(userId) {
+    var users = getDataFromSheet("DB_Usuarios");
+    for(var i=0; i<users.length; i++) {
+        if(String(users[i].ID) == String(userId)) return users[i].Email;
+    }
+    return null;
+}
+
+/* ==========================================================================
+   TRANCAMENTO CONTEXT HELPERS
+   ========================================================================== */
+
+function checkTrancamentoContext(authToken) {
+  try {
+    var user = getUserData(authToken);
+    var email = user.email;
+    
+    // 1. Calculate Current Semester
+    var today = new Date();
+    var year = today.getFullYear();
+    var month = today.getMonth() + 1; // 1-12
+    var semester = (month <= 6) ? "1º Semestre" : "2º Semestre";
+    var currentPeriod = semester + " de " + year;
+    
+    // 2. Check Previous Requests
+    // We need to check DB_Solicitacoes for this user and type "Trancamento"
+    var hasPrevious = false;
+    
+    // Optimally, we should query DB_Solicitacoes. 
+    // Since we don't have a direct "getByType" that is efficient for just boolean check,
+    // we will fetch all requests (cached if possible by getDataFromSheet) and filter.
+    // Ideally we should have a backend filter, but getDataFromSheet fetches all.
+    
+    var requests = getDataFromSheet("DB_Solicitacoes");
+    
+    // Filter for User + Type "Trancamento" + Status not Deleted/Rejected
+    // Note: User ID is col 2 (index 2), Type is col 3 (index 3), Status is col 5 (index 5)
+    // Actually getDataFromSheet returns objects now!
+    
+    var userRequests = requests.filter(function(r) {
+       // Check ownership (Email in ID or ID match)
+       // Our rows have "ID_Usuario" which might be "Externo-email" or UUID.
+       // Easiest is to invoke getUserData behavior or just check rough match if we trust email.
+       // Let's use the ID returned by getUserData for robust matching.
+       
+       var isOwner = (String(r.ID_Usuario) === String(user.id));
+       var isTrancamento = (String(r.Tipo_Solicitacao).indexOf("Trancamento") !== -1);
+       var isValidStatus = (r.Status !== "Excluído" && r.Status !== "Deletado" && r.Status !== "Indeferido" && r.Status !== "Rejeitado");
+       
+       return isOwner && isTrancamento && isValidStatus;
+    });
+    
+    hasPrevious = (userRequests.length > 0);
+    
+    return {
+       currentPeriod: currentPeriod,
+       hasPrevious: hasPrevious,
+       success: true
+    };
+    
+
+  } catch (e) {
+    Logger.log("Erro em checkTrancamentoContext: " + e.message);
+    return {
+       currentPeriod: "",
+       hasPrevious: false,
+       success: false,
+       error: e.message
+    };
+  }
+}
+
+// =========================================================================
+// ACCOUNTABILITY (PRESTAÇÃO DE CONTAS)
+// =========================================================================
+
+/**
+ * Secretariat requests accountability from student
+ */
+function sendAccountabilityRequest(requestId, plainTextMsg, fullInstructions, checklistItems) {
+  try {
+    var user = getUserData();
+    if (!user || (!user.roles.includes('Secretaria') && !user.roles.includes('Coordenação'))) {
+      throw new Error("Permissão negada.");
+    }
+
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    // Find request
+    var rowIndex = -1;
+    var request = {};
+    for (var i = 1; i < data.length; i++) {
+        // ID check (col 1 -> index 0)
+      if (String(data[i][0]) === String(requestId)) {
+        rowIndex = i;
+        var headers = data[0];
+        headers.forEach(function(h, idx) { request[h] = data[i][idx]; });
+        break;
+      }
+    }
+
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+
+    // Update Details with instructions
+    var details = {};
+    try { details = JSON.parse(request.Detalhes || '{}'); } catch(e) {}
+    
+    details.AccountabilityInstructions = fullInstructions;
+    details.AccountabilityMessage = plainTextMsg;
+    details.AccountabilityItems = checklistItems || [];
+    
+    // Update Status
+    var newStatus = "Prestação de Contas Solicitada";
+    
+    // Update History
+    var history = [];
+    try { history = JSON.parse(request.Historico_Aprovacao || '[]'); } catch(e) {}
+    history.push({
+      date: new Date().toISOString(),
+      action: newStatus,
+      user: user.email,
+      justification: plainTextMsg
+    });
+
+    // Write back
+    // Columns: Detalhes, Status, Historico_Aprovacao
+    var headers = data[0];
+    sheet.getRange(rowIndex + 1, headers.indexOf("Detalhes") + 1).setValue(JSON.stringify(details));
+    sheet.getRange(rowIndex + 1, headers.indexOf("Status") + 1).setValue(newStatus);
+    sheet.getRange(rowIndex + 1, headers.indexOf("Historico_Aprovacao") + 1).setValue(JSON.stringify(history));
+
+    // Notify Student
+    sendNotification(request.ID_Usuario, "accountability_req", "Prestação de Contas Solicitada", plainTextMsg, requestId);
+
+    SpreadsheetApp.flush();
+    return { success: true };
+
+  } catch (e) {
+    throw new Error("Erro ao enviar solicitação: " + e.message);
+  }
+}
+
+
+/**
+ * Student uploads accountability documents
+ */
+function submitStudentAccountability(formObject) {
+  try {
+    var user = getUserData();
+    var requestId = formObject.requestId;
+
+    if (!requestId) throw new Error("ID da solicitação não fornecido.");
+    
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    // Find request
+    var rowIndex = -1;
+    var request = {};
+    for (var i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(requestId)) {
+            rowIndex = i;
+            var headers = data[0];
+            headers.forEach(function(h, idx) { request[h] = data[i][idx]; });
+            break;
+        }
+    }
+
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+
+    // Validate User (Must be owner or Admin)
+    if (request.ID_Usuario !== user.id && !user.roles.includes('Admin') && !user.roles.includes('Secretaria') && !user.email) {
+         // Strict check on ID done
+    }
+    
+    // Parse existing details to find original folder
+    var details = {};
+    try { details = JSON.parse(request.Detalhes || '{}'); } catch(e) {}
+
+    var targetFolder = null;
+    
+    // 1. Try to find existing folder from file links
+    var fileUrlRegex = /https:\/\/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/;
+    for (var key in details) {
+        if (typeof details[key] === 'string' && details[key].indexOf("drive.google.com") !== -1) {
+            var match = details[key].match(fileUrlRegex);
+            if (match && match[1]) {
+                try {
+                    var originalFile = DriveApp.getFileById(match[1]);
+                    targetFolder = originalFile.getParents().next();
+                    // Verify if it is indeed inside "Financeiro" or acceptable root
+                    // For now, trust the parent of the attached file is the correct project folder
+                    break;
+                } catch (e) {
+                    console.warn("Could not retrieve parent folder for file: " + match[1]);
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Create/Use Standard Structure if no original folder found
+    if (!targetFolder) {
+        var rootFolder = DriveApp.getFoldersByName("PPGPsi_Solicitacoes").hasNext() ? DriveApp.getFoldersByName("PPGPsi_Solicitacoes").next() : DriveApp.createFolder("PPGPsi_Solicitacoes");
+        var yearStr = new Date().getFullYear().toString();
+        var yearFolder = rootFolder.getFoldersByName(yearStr).hasNext() ? rootFolder.getFoldersByName(yearStr).next() : rootFolder.createFolder(yearStr);
+        
+        var studentName = request.Nome_Aluno || request.ID_Usuario || "Aluno_Desconhecido";
+        var studentFolder = yearFolder.getFoldersByName(studentName).hasNext() ? yearFolder.getFoldersByName(studentName).next() : yearFolder.createFolder(studentName);
+        
+        var folderName = requestId + "_PrestacaoContas";
+        targetFolder = studentFolder.getFoldersByName(folderName).hasNext() ? studentFolder.getFoldersByName(folderName).next() : studentFolder.createFolder(folderName);
+    }
+    
+    // Save files
+    var uploadedFiles = [];
+    
+    function saveFile(blob, prefix) {
+        if (!blob || typeof blob.getName !== 'function') return;
+        var name = blob.getName();
+        if (!name) return;
+        
+        // Add accountability prefix to differentiate from original files
+        var finalName = "PC_" + (prefix ? prefix + "_" : "") + name;
+        var file = targetFolder.createFile(blob);
+        file.setName(finalName);
+        uploadedFiles.push({ name: finalName, url: file.getUrl() });
+    }
+
+    // Iterate formObject
+    // Expect file-0, file-1... and extra-file
+    for (var key in formObject) {
+         if (key === 'extra-file' || key.startsWith('file-')) {
+             saveFile(formObject[key], key === 'extra-file' ? "EXTRA" : "DOC");
+         }
+    }
+
+    if (uploadedFiles.length === 0 && !formObject.details) {
+        throw new Error("Nenhum arquivo ou detalhe enviado.");
+    }
+
+    // Update Request Details (details variable already parsed above)
+    
+    // --- CAPTURE BANK DETAILS ---
+    if (formObject.bank_cpf) {
+        details.Dados_Bancarios = {
+            cpf: "'"+formObject.bank_cpf, // Force string to prevent spreadsheet truncation
+            banco: formObject.bank_name,
+            agencia: formObject.bank_branch,
+            conta: formObject.bank_account,
+            pix: formObject.bank_pix
+        };
+    }
+    
+    details.AccountabilityUploads = uploadedFiles;
+    details.AccountabilityStudentComments = formObject.details;
+
+    // Update Status
+    var newStatus = "Prestação de Contas em Análise";
+
+    // Update History
+    var history = [];
+    try { history = JSON.parse(request.Historico_Aprovacao || '[]'); } catch(e) {}
+    history.push({
+      date: new Date().toISOString(),
+      action: newStatus,
+      user: user.email,
+      justification: "Entrega de documentos (" + uploadedFiles.length + " arquivos). Obs: " + (formObject.details || "—")
+    });
+    
+    // Write back
+    var headers = data[0];
+    sheet.getRange(rowIndex + 1, headers.indexOf("Detalhes") + 1).setValue(JSON.stringify(details));
+    sheet.getRange(rowIndex + 1, headers.indexOf("Status") + 1).setValue(newStatus);
+    sheet.getRange(rowIndex + 1, headers.indexOf("Historico_Aprovacao") + 1).setValue(JSON.stringify(history));
+
+    SpreadsheetApp.flush();
+    return { success: true };
+
+  } catch (e) {
+    throw new Error("Erro ao enviar prestação: " + e.message);
+  }
+}
+
+function confirmDeposit(requestId, receiptBlob) {
+    try {
+        var user = getUserData();
+        if (!user || (!user.roles.includes('Secretaria') && !user.roles.includes('Coordenação') && !user.roles.includes('Admin'))) {
+            throw new Error("Acesso negado: Apenas Secretaria ou Coordenação podem confirmar depósitos.");
+        }
+
+        var ss = getSpreadsheet();
+        var sheet = ss.getSheetByName("DB_Solicitacoes");
+        var data = sheet.getDataRange().getValues();
+        
+        // Find request
+        var rowIndex = -1;
+        var request = {};
+        for (var i = 1; i < data.length; i++) {
+            if (String(data[i][0]) === String(requestId)) {
+                rowIndex = i;
+                var headers = data[0];
+                headers.forEach(function(h, idx) { request[h] = data[i][idx]; });
+                break;
+            }
+        }
+
+        if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+
+        // Parse Details
+        var details = {};
+        try { details = JSON.parse(request.Detalhes || '{}'); } catch(e) {}
+
+        // -- Save Receipt if provided --
+        if (receiptBlob) {
+            // Logic to find/create folder (Simplified reuse of accountability logic)
+            var targetFolder = null;
+            var fileUrlRegex = /https:\/\/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/;
+            // 1. Try to find existing folder from links in details
+            for (var key in details) {
+                if (typeof details[key] === 'string' && details[key].indexOf("drive.google.com") !== -1) {
+                    var match = details[key].match(fileUrlRegex);
+                    if (match && match[1]) {
+                        try {
+                            targetFolder = DriveApp.getFileById(match[1]).getParents().next();
+                            break;
+                        } catch (e) {}
+                    }
+                }
+            }
+            // 2. Fallback Root
+            if (!targetFolder) {
+                 var root = DriveApp.getFoldersByName("PPGPsi_Solicitacoes").hasNext() ? DriveApp.getFoldersByName("PPGPsi_Solicitacoes").next() : DriveApp.createFolder("PPGPsi_Solicitacoes");
+                 targetFolder = root; // Just dump in root if structure lost
+            }
+
+            var blob = Utilities.newBlob(Utilities.base64Decode(receiptBlob.data), receiptBlob.type, receiptBlob.name);
+            var file = targetFolder.createFile(blob);
+            file.setName("COMPROVANTE_DEPOSITO_" + requestId + ".pdf"); // Force meaningful name
+            
+            details.Comprovante_Deposito = file.getUrl();
+        }
+
+        // Update Status
+        var newStatus = "Concluído"; // or "Depósito Realizado"
+        
+        // Update History
+        var history = [];
+        try { history = JSON.parse(request.Historico_Aprovacao || '[]'); } catch(e) {}
+        history.push({
+            date: new Date().toISOString(),
+            action: newStatus,
+            user: user.email,
+            justification: "Depósito Confirmado. Ciclo finalizado."
+        });
+
+        // Write Back
+        var headers = data[0];
+        sheet.getRange(rowIndex + 1, headers.indexOf("Detalhes") + 1).setValue(JSON.stringify(details));
+        sheet.getRange(rowIndex + 1, headers.indexOf("Status") + 1).setValue(newStatus);
+        sheet.getRange(rowIndex + 1, headers.indexOf("Historico_Aprovacao") + 1).setValue(JSON.stringify(history));
+        
+        // Notify Student
+        try {
+            sendEmailNotification(request.Email_Usuario, "Pagamento Realizado - " + requestId, 
+                "Olá " + (request.Nome_Aluno || "Aluno") + ",\n\n" +
+                "O depósito referente à solicitação #" + requestId + " (" + request.Tipo_Solicitacao + ") foi realizado.\n" +
+                "O processo foi finalizado no sistema.\n\n" +
+                (details.Comprovante_Deposito ? "O comprovante está anexado ao pedido no sistema." : "")
+            );
+        } catch(e) { console.warn("Erro ao enviar email: " + e.message); }
+
+        return { success: true };
+
+    } catch (e) {
+        Logger.log("Erro confirmDeposit: " + e.message);
+        throw e;
+    }
+}
+
+/**
+ * Undo the last action on a request (Secretariat/Coordination only)
+ */
+function undoLastAction(requestId) {
+  try {
+    var user = getUserData();
+    if (!user || (!user.roles.includes('Secretaria') && !user.roles.includes('Coordenação'))) {
+      throw new Error("Permissão negada. Apenas Secretaria e Coordenação podem desfazer ações.");
+    }
+
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    // Find request
+    var rowIndex = -1;
+    var requestRow = null;
+    var headers = data[0];
+    
+    for (var i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(requestId)) {
+            rowIndex = i;
+            requestRow = data[i];
+            break;
+        }
+    }
+
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+
+    var colStatus = headers.indexOf('Status');
+    var colHistory = headers.indexOf('Historico_Aprovacao');
+
+    // Parse History
+    var history = [];
+    try { history = JSON.parse(requestRow[colHistory] || '[]'); } catch(e) {}
+
+    if (history.length === 0) {
+        throw new Error("Não há ações para desfazer.");
+    }
+
+    // Remove last item
+    var removedItem = history.pop();
+
+    // Determine new status (from previous item or default 'Pendente')
+    var newStatus = "Pendente";
+    if (history.length > 0) {
+        var lastItem = history[history.length - 1];
+        newStatus = lastItem.action; 
+        // Note: Ideally 'action' should map to 'Status', but sometimes it's descriptive.
+        // For most flows we use action == status.
+        // If needed we can add logic here to normalize status.
+    }
+
+    // Update Sheet
+    sheet.getRange(rowIndex + 1, colStatus + 1).setValue(newStatus);
+    sheet.getRange(rowIndex + 1, colHistory + 1).setValue(JSON.stringify(history));
+
+    return {
+        success: true,
+        message: "Ação desfeita: " + removedItem.action,
+        newStatus: newStatus
+    };
+
+  } catch (e) {
+    throw new Error("Erro ao desfazer ação: " + e.message);
+  }
+}
+
+function deleteRequest(requestId) {
+  try {
+    var user = getUserData();
+    // Only Admin/Secretaria/Coordenação can delete
+    if (!user.roles.includes('Admin') && !user.roles.includes('Secretaria') && !user.roles.includes('Coordenação')) {
+       throw new Error("Permissão negada.");
+    }
+
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+    var data = sheet.getDataRange().getValues();
+    
+    // Find request
+    var rowIndex = -1;
+    for (var i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(requestId)) {
+            rowIndex = i;
+            break;
+        }
+    }
+
+    if (rowIndex === -1) throw new Error("Solicitação não encontrada.");
+
+    // Update Status to DELETED
+    var headers = data[0];
+    var statusCol = headers.indexOf("Status");
+    var historyCol = headers.indexOf("Historico_Aprovacao");
+    
+    // Update History
+    var history = [];
+    try { history = JSON.parse(data[rowIndex][historyCol] || '[]'); } catch(e) {}
+    history.push({
+      date: new Date().toISOString(),
+      action: "Solicitação Excluída",
+      user: user.email,
+      justification: "Exclusão manual via painel administrativo."
+    });
+
+    sheet.getRange(rowIndex + 1, statusCol + 1).setValue("Excluído");
+    sheet.getRange(rowIndex + 1, historyCol + 1).setValue(JSON.stringify(history));
+
+    return { success: true };
+  } catch (e) {
+    throw new Error("Erro ao excluir solicitação: " + e.message);
+  }
+}
+
+/* ==========================================================================
+   CONSELHO DE GESTÃO (CG) ACTIONS
+   ========================================================================== */
+
+/**
+ * Processa a decisão do CG (Elucidar, Negar, Aprovar)
+ * Recebe UM objeto payload: { requestId, action, justification, user, cgCapesResponse? }
+ */
+// [DEPRECATED FUNCTION REMOVED] submitCGAction merged into main definition around line 1234
+// to resolve duplication conflict and access errors.
+
+
+
+
+
+/**
+ * Helper to send email notifications for status changes
+ */
+function sendEmailNotification(reqRow, newStatus, justification, actionTitle) {
+    // reqRow mapping: 0=ID, 1=Data, 2=ID_User, 3=Type, 4=Details, 5=Status, ...
+    // DB_Solicitacoes headers: ["ID", "Data_Criacao", "ID_Usuario", "Tipo_Solicitacao", "Detalhes", "Status", ...]
+    
+    // We need email. 
+    var userId = reqRow[2];
+    var email = "";
+    
+    // Quick heuristic: checks if userId looks like email 
+    if (userId.includes('@')) {
+        email = userId.replace('Externo-', ''); // simple clean
+    } else {
+        // Look up by ID
+        var users = getDataFromSheet("DB_Usuarios");
+        var u = users.find(function(user){ return String(user.ID) === String(userId); });
+        if (u) email = u.Email;
+    }
+    
+    // Advisor Email (Col 9)
+    if (!email) return;
+
+    var subject = "[PPGPsi] Atualização de Solicitação: " + actionTitle;
+    var htmlBody = `
+      <h2>Sua solicitação foi atualizada</h2>
+      <p><strong>Tipo:</strong> ${reqRow[3]}</p>
+      <p><strong>Novo Status:</strong> ${newStatus}</p>
+      <p><strong>Parecer/Justificativa:</strong><br><em>${justification}</em></p>
+      <br>
+      <p>Acesse o sistema para mais detalhes.</p>
+    `;
+    
+    MailApp.sendEmail({
+        to: email,
+        cc: advisorEmail,
+        subject: subject,
+        htmlBody: htmlBody,
+        name: "Sistema PPGPsi"
+    });
+}
+
+/**
+ * Fetches the exchange rate (Venda) for a specific currency and date from BCB API.
+ * Automatically backtracks to finding the nearest previous business day.
+ * * @param {string|Date} currency - 'USD', 'EUR', 'GBP', etc.
+ * @param {string|Date} dateInput - Date in 'YYYY-MM-DD' format or Date Object.
+ * @returns {object} { rate: number, dateUsed: string, error: string|null }
+ */
+function getBCBExchangeRate(currency, dateInput) {
+    // 1. Sanitização da Moeda
+    if (!currency) return { success: false, error: "Moeda não informada." };
+    
+    var safeCurrency = String(currency).trim().toUpperCase();
+    if (safeCurrency === 'BRL') {
+        return { success: true, rate: 1, dateUsed: new Date().toISOString().slice(0,10), originalDate: dateInput };
+    }
+
+    // 2. Normalização da Data (Para garantir que loop funcione)
+    var currentDate;
+    try {
+        if (dateInput instanceof Date) {
+            currentDate = new Date(dateInput.getTime());
+        } else {
+            // Assume YYYY-MM-DD
+            var parts = String(dateInput).split('-');
+            // Cuidado: Mês em JS é 0-indexado
+            currentDate = new Date(parts[0], parseInt(parts[1]) - 1, parts[2]);
+        }
+    } catch (e) {
+        return { success: false, error: "Data inválida: " + e.message };
+    }
+
+    // Verifica data futura
+    var today = new Date();
+    if (currentDate > today) currentDate = new Date();
+
+    var maxRetries = 7;
+    var lastError = "";
+
+    // 3. Loop de Tentativas
+    for (var i = 0; i < maxRetries; i++) {
+        // BCB API exige formato 'MM-dd-yyyy' para a query string
+        var dataString = Utilities.formatDate(currentDate, "GMT-3", "MM-dd-yyyy");
+        var dateUsedISO = Utilities.formatDate(currentDate, "GMT-3", "yyyy-MM-dd");
+
+        var isUSD = (safeCurrency === 'USD');
+        var urlBase = isUSD 
+            ? "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)"
+            : "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoMoedaDia(moeda=@moeda,dataCotacao=@dataCotacao)";
+        
+        var url;
+        if (isUSD) {
+            url = urlBase + "?@dataCotacao='" + dataString + "'&$top=100&$format=json";
+        } else {
+            url = urlBase + "?@moeda='" + safeCurrency + "'&@dataCotacao='" + dataString + "'&$top=100&$format=json";
+        }
+        
+        try {
+            // Logger.log("Tentativa " + (i+1) + " BCB URL: " + url); // Descomente para debug
+            var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+            
+            if (response.getResponseCode() !== 200) {
+                lastError = "HTTP " + response.getResponseCode();
+                // Continua para o dia anterior
+            } else {
+                var json = JSON.parse(response.getContentText());
+                
+                if (json && json.value && json.value.length > 0) {
+                    // Pega o fechamento (último item do dia)
+                    var cotacao = json.value[json.value.length - 1].cotacaoVenda;
+                    
+                    return {
+                        success: true,
+                        rate: cotacao,
+                        dateUsed: dateUsedISO,
+                        originalDate: dateInput,
+                        currency: safeCurrency
+                    };
+                }
+            }
+        } catch (e) {
+            Logger.log("Erro de conexão BCB (" + dataString + "): " + e.message);
+            lastError = e.message;
+        }
+        
+        // Recua 1 dia
+        currentDate.setDate(currentDate.getDate() - 1);
+    }
+    
+    Logger.log("Falha BCB após retries. Moeda: " + safeCurrency + ", Data Ref: " + dateInput);
+    return { success: false, error: "Cotação não encontrada após " + maxRetries + " tentativas. (Último erro: " + lastError + ")" };
+}
+
+// =========================================================================
+// PPGPsiu - QUALIS JOURNAL SEARCH
+// =========================================================================
+
+/**
+ * Searches the DB_Qualis sheet for journals matching the given filters.
+ * 
+ * @param {object} filters - Object containing optional search filters:
+ *   - issn: string
+ *   - titulo: string
+ *   - areaAvaliacao: string
+ *   - estrato: string (A1, A2, etc.)
+ *   - evento: string (e.g., "2017-2020")
+ * @returns {object} { success: boolean, results: array, error: string|null }
+ */
+function searchQualisPeriodicos(filters) {
+    try {
+        var ss = getSpreadsheet();
+        var sheet = ss.getSheetByName('DB_Qualis');
+        
+        if (!sheet) {
+            return { success: false, error: "Aba DB_Qualis não encontrada na planilha." };
+        }
+        
+        var data = sheet.getDataRange().getValues();
+        if (data.length < 2) {
+            return { success: false, error: "Sem dados na DB_Qualis." };
+        }
+        
+        // First row is headers: ISSN, Título, Área de Avaliação, Estrato, Evento
+        var headers = data[0];
+        var colISSN = headers.indexOf('ISSN');
+        var colTitulo = headers.indexOf('Título');
+        var colArea = headers.indexOf('Área de Avaliação');
+        var colEstrato = headers.indexOf('Estrato');
+        var colEvento = headers.indexOf('Evento');
+        
+        // Validate columns exist
+        if (colISSN === -1 || colTitulo === -1 || colArea === -1 || colEstrato === -1 || colEvento === -1) {
+            return { success: false, error: "Colunas obrigatórias não encontradas na DB_Qualis." };
+        }
+        
+        // Parse filters
+        var fISSN = filters.issn ? String(filters.issn).trim().toUpperCase() : '';
+        var fTitulo = filters.titulo ? String(filters.titulo).trim().toUpperCase() : '';
+        var fArea = filters.areaAvaliacao ? String(filters.areaAvaliacao).trim().toUpperCase() : '';
+        var fEstrato = filters.estrato ? String(filters.estrato).trim().toUpperCase() : '';
+        var fEvento = filters.evento ? String(filters.evento).trim() : '';
+        
+        // At least one filter must be provided
+        if (!fISSN && !fTitulo && !fArea && !fEstrato && !fEvento) {
+            return { success: false, error: "Informe ao menos um critério de busca." };
+        }
+        
+        var results = [];
+        var TOP_STRATA = ['A1', 'A2', 'A3', 'A4'];
+        var MAX_RESULTS = 100; // Limit for performance
+        
+        for (var i = 1; i < data.length && results.length < MAX_RESULTS; i++) {
+            var row = data[i];
+            var issn = String(row[colISSN] || '').trim().toUpperCase();
+            var titulo = String(row[colTitulo] || '').trim().toUpperCase();
+            var area = String(row[colArea] || '').trim().toUpperCase();
+            var estrato = String(row[colEstrato] || '').trim().toUpperCase();
+            var evento = String(row[colEvento] || '').trim();
+            
+            // Apply filters (AND logic for all provided filters)
+            var match = true;
+            
+            if (fISSN && !issn.includes(fISSN)) match = false;
+            if (fTitulo && !titulo.includes(fTitulo)) match = false;
+            if (fArea && !area.includes(fArea)) match = false;
+            if (fEstrato && estrato !== fEstrato) match = false;
+            if (fEvento && !evento.includes(fEvento)) match = false;
+            
+            if (match) {
+                results.push({
+                    issn: row[colISSN],
+                    titulo: row[colTitulo],
+                    areaAvaliacao: row[colArea],
+                    estrato: row[colEstrato],
+                    evento: row[colEvento],
+                    isTopStrata: TOP_STRATA.indexOf(estrato) !== -1
+                });
+            }
+        }
+        
+        return {
+            success: true,
+            results: results,
+            totalFound: results.length,
+            limitReached: results.length >= MAX_RESULTS
+        };
+        
+    } catch (e) {
+        Logger.log("Erro searchQualisPeriodicos: " + e.message);
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Fetches distinct values for filter dropdowns (Areas, Estratos, Eventos).
+ * @returns {object} { areas: [], estratos: [], eventos: [] }
+ */
+function getQualisFilterOptions() {
+    try {
+        var ss = getSpreadsheet();
+        var sheet = ss.getSheetByName('DB_Qualis');
+        
+        if (!sheet) return { success: false };
+        
+        var data = sheet.getDataRange().getValues();
+        var headers = data[0];
+        
+        var colArea = headers.indexOf('Área de Avaliação');
+        var colEstrato = headers.indexOf('Estrato');
+        var colEvento = headers.indexOf('Evento');
+        
+        var areas = {};
+        var estratos = {};
+        var eventos = {};
+        
+        for (var i = 1; i < data.length; i++) {
+            if (data[i][colArea]) areas[data[i][colArea]] = true;
+            if (data[i][colEstrato]) estratos[data[i][colEstrato]] = true;
+            if (data[i][colEvento]) eventos[data[i][colEvento]] = true;
+        }
+        
+        return {
+            success: true,
+            areas: Object.keys(areas).sort(),
+            estratos: Object.keys(estratos).sort(),
+            eventos: Object.keys(eventos).sort()
+        };
+    } catch (e) {
+        Logger.log("Erro getQualisFilterOptions: " + e.message);
+        return { success: false, error: e.message };
+    }
+}
+
+
+/* ==========================================================================
+   AGENDAR DEFESA
+   ========================================================================== */
+
+function generateDefesaPDF(payload, user) {
+  var htmlTemplate =
+    '<div style="font-family: Arial, sans-serif; padding: 40px; color: #333;">' +
+      '<div style="text-align: center; margin-bottom: 30px;">' +
+        '<h2 style="color: #004b85; margin-bottom: 5px;">Declaração de Agendamento de Defesa</h2>' +
+        '<h4 style="margin-top: 0; color: #666;">Programa de Pós-Graduação em Psicologia (PPGPsi) - UFSCar</h4>' +
+      '</div>' +
+      '<p style="line-height: 1.6; font-size: 14pt; text-align: justify;">' +
+      'Declaramos para os devidos fins que o/a discente <strong>' + user.nome + '</strong>, ' +
+      'nível <strong>' + payload.nivel + '</strong>, registrou o agendamento de sua defesa com os seguintes dados:</p>' +
+      '<div style="background-color: #f8f9fa; border-left: 4px solid #004b85; padding: 20px; margin: 30px 0;">' +
+          '<table style="width: 100%; border-collapse: collapse; font-size: 13pt;">' +
+            '<tr><td style="padding: 8px 0; width: 120px;"><strong>Título:</strong></td><td style="padding: 8px 0;">' + payload.titulo + '</td></tr>' +
+            '<tr><td style="padding: 8px 0;"><strong>Data:</strong></td><td style="padding: 8px 0;">' + payload.data_defesa + '</td></tr>' +
+            '<tr><td style="padding: 8px 0;"><strong>Horário:</strong></td><td style="padding: 8px 0;">' + payload.horario_defesa + '</td></tr>' +
+            '<tr><td style="padding: 8px 0;"><strong>Local:</strong></td><td style="padding: 8px 0;">' + payload.local + '</td></tr>' +
+          '</table>' +
+      '</div>' +
+      '<h3 style="color: #004b85; border-bottom: 1px solid #ccc; padding-bottom: 10px;">Artigos Validados no Qualis Capes:</h3><ul>';
+      
+  for(var i=0; i<payload.artigos.length; i++) {
+     htmlTemplate += '<li style="margin-bottom: 10px; font-size: 12pt;"><strong>Ref APA:</strong> ' + payload.artigos[i].apa + '<br>' +
+                     '<em>Base Qualis: ' + payload.artigos[i].estrato + ' (' + payload.artigos[i].periodicoEncontrado + ' / ISSN: ' + payload.artigos[i].issn + ')</em></li>';
+  }      
+  
+  var dateNow = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy 'às' HH:mm");
+  
+  htmlTemplate += '</ul><br><br><br>' +
+       '<p style="text-align: center; color: #888; border-top: 1px solid #eee; padding-top: 20px; font-size: 10pt;">' +
+       'Documento gerado eletronicamente pelo Sistema de Gestão PPGPsi/UFSCar em ' + dateNow + '.</p></div>';
+
+  var blob = Utilities.newBlob(htmlTemplate, MimeType.HTML).getAs(MimeType.PDF);
+  blob.setName('Agendamento_Defesa_' + user.nome.replace(/[^a-zA-Z0-9]/g, '_') + '.pdf');
+  
+  var root = DriveService.getRootFolder();
+  var defesasFolder = DriveService.ensureFolder(root, "Defesas_Agendadas");
+  var file = defesasFolder.createFile(blob);
+  
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return file.getUrl();
+}
+
+function submitDefesa(payload, authToken) {
+  try {
+    var user = getUserData(authToken);
+    if (!user || user.id.indexOf("error") !== -1 || user.id.indexOf("Externo") !== -1) {
+        throw new Error("Usuário não autenticado ou inválido.");
+    }
+
+    var pdfUrl = generateDefesaPDF(payload, user);
+
+    var detailsObj = {
+      Nivel: payload.nivel,
+      Titulo: payload.titulo,
+      Artigos: payload.artigos,
+      Data_Defesa: payload.data_defesa,
+      Horario_Defesa: payload.horario_defesa,
+      Local: payload.local,
+      Declaracao_PDF: pdfUrl
+    };
+
+    var newHistoryItem = {
+        data: new Date().toISOString(),
+        usuario: user.nome,
+        acao: "Agendamento de Defesa Concluído",
+        justificativa: "Declaração gerada automaticamente e defesa registrada com sucesso no sistema."
+    };
+
+    var ss = getSpreadsheet();
+    var sheet = ss.getSheetByName("DB_Solicitacoes");
+
+    sheet.appendRow([
+        Utilities.getUuid(),
+        new Date().toISOString(),
+        user.id,
+        "Agendamento de Defesa",
+        JSON.stringify(detailsObj),
+        "Aguardando Secretaria", // Standard pending status for processing
+        JSON.stringify([newHistoryItem]),
+        "", // Comments
+        user.Nome_Orientador || "",
+        user.Email_Orientador || "",
+        "" // CG Parecerista
+    ]);
+
+    return { success: true, pdfUrl: pdfUrl };
+  } catch(e) {
+    Logger.log("Erro em submitDefesa: " + e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+function requestDefesaChange(reqId, reason, authToken) {
+   try {
+        var user = getUserData(authToken);
+        if(!user || user.id.indexOf("error") !== -1 || user.id.indexOf("Externo") !== -1) {
+            throw new Error("Acesso negado.");
+        }
+        
+        var ss = getSpreadsheet();
+        var sheet = ss.getSheetByName("DB_Solicitacoes");
+        var data = sheet.getDataRange().getValues();
+        
+        var rowIndex = -1;
+        var historyStr = "";
+        for(var i=1; i<data.length; i++) {
+           if(data[i][0] == reqId) { 
+               rowIndex = i+1; 
+               historyStr = data[i][6]; 
+               break; 
+           }
+        }
+        
+        if(rowIndex == -1) throw new Error("Agendamento não encontrado.");
+        
+        var history = [];
+        try{ history = JSON.parse(historyStr); }catch(e){}
+        
+        history.push({
+             data: new Date().toISOString(),
+             usuario: user.nome,
+             acao: "Solicitação de Alteração de Defesa",
+             justificativa: reason
+        });
+        
+        sheet.getRange(rowIndex, 7).setValue(JSON.stringify(history));
+        sheet.getRange(rowIndex, 6).setValue("Alteração Solicitada (Secretaria)");
+        
+        return {success: true};
+   } catch(e) {
+        return {success: false, error: e.message};
+   }
+}

@@ -1,0 +1,240 @@
+import { collection, query, where, getDocs, doc, updateDoc, addDoc, orderBy, limit, getDoc } from 'firebase/firestore';
+import { db } from '@/lib/firebase';
+import { AppRole } from '@/components/FirebaseProvider';
+
+/**
+ * Este arquivo simula o comportamento do backend no Google Apps Script (Code.gs).
+ * Todas as regras de negócio e interações com o banco de dados estão centralizadas aqui.
+ * No ambiente GAS, estas funções seriam chamadas via `google.script.run`.
+ */
+
+// ==========================================
+// USUÁRIOS (USERS)
+// ==========================================
+
+export async function fetchAllUsers(): Promise<any[]> {
+  const q = query(collection(db, 'users'));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
+
+export async function updateUserRoles(userId: string, roles: AppRole[]) {
+  // Validação de backend: garantir que pelo menos 'Visitante' exista
+  const finalRoles = roles.length > 0 ? roles : ['Visitante'];
+  await updateDoc(doc(db, 'users', userId), { roles: finalRoles });
+  return finalRoles;
+}
+
+// ==========================================
+// SOLICITAÇÕES (REQUESTS)
+// ==========================================
+
+export async function fetchUserRequests(userId: string): Promise<any[]> {
+  const q = query(collection(db, 'requests'), where('userId', '==', userId));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
+
+export async function fetchRequestsByRole(role: AppRole): Promise<any[]> {
+  let q;
+  if (role === 'Docente') {
+    // Docentes veem solicitações aguardando orientador e outras que eles já avaliaram
+    // Idealmente: where('orientadorEmail', '==', userEmail)
+    q = query(collection(db, 'requests'), orderBy('createdAt', 'desc'));
+  } else if (role === 'Secretaria') {
+    // Secretaria vê todas as solicitações (ou filtradas por status ativos)
+    q = query(collection(db, 'requests'), orderBy('createdAt', 'desc'));
+  } else if (role === 'Conselho') {
+    // Conselho vê solicitações em pauta
+    q = query(collection(db, 'requests'), where('status', '==', 'Em Pauta'), orderBy('createdAt', 'desc'));
+  } else {
+    return [];
+  }
+
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
+
+export async function createNewRequest(data: any) {
+  // Validação de backend
+  if (!data.userId || !data.tipoSolicitacao) {
+    throw new Error('Dados incompletos para criar solicitação.');
+  }
+
+  const requestData = {
+    ...data,
+    status: 'Aguardando Orientador',
+    historicoAprovacao: JSON.stringify([{
+      action: 'Solicitação Criada',
+      user: data.emailSolicitante,
+      date: new Date().toISOString()
+    }]),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const docRef = await addDoc(collection(db, 'requests'), requestData);
+  return { id: docRef.id, ...requestData };
+}
+
+export async function processRequestStatus(
+  requestId: string,
+  newStatus: string,
+  justification: string,
+  userEmail: string,
+  userRole: AppRole
+) {
+  const reqRef = doc(db, 'requests', requestId);
+  const reqSnap = await getDoc(reqRef);
+
+  if (!reqSnap.exists()) {
+    throw new Error('Solicitação não encontrada.');
+  }
+
+  const reqData = reqSnap.data();
+  const currentStatus = reqData.status;
+
+  // ==========================================
+  // VALIDAÇÃO DE MÁQUINA DE ESTADOS (BACKEND)
+  // ==========================================
+  let isValidTransition = false;
+
+  if (userRole === "Docente") {
+    if (currentStatus === "Aguardando Orientador") {
+      if (
+        newStatus === "Pendente" ||
+        newStatus === "Aguardando CG" ||
+        newStatus === "Reprovado pelo Orientador" ||
+        newStatus === "Retornado ao Aluno"
+      ) {
+        isValidTransition = true;
+      }
+    }
+  } else if (userRole === "Secretaria") {
+    if (currentStatus === "Pendente" || currentStatus === "Aguardando CG") {
+      if (newStatus === "Em Pauta" || newStatus === "Aprovado" || newStatus === "Recusado") {
+        isValidTransition = true;
+      }
+    } else if (currentStatus === "Em Pauta") {
+      if (newStatus === "Aprovado" || newStatus === "Recusado") {
+        isValidTransition = true;
+      }
+    }
+  } else if (userRole === "Conselho") {
+    if (currentStatus === "Em Pauta") {
+      if (newStatus === "Aprovado" || newStatus === "Recusado") {
+        isValidTransition = true;
+      }
+    }
+  }
+
+  if (!isValidTransition) {
+    throw new Error(`Transição de status inválida: ${currentStatus} -> ${newStatus} para o papel ${userRole}`);
+  }
+
+  let history = [];
+  try {
+    history = JSON.parse(reqData.historicoAprovacao || '[]');
+  } catch (e) { }
+
+  history.push({
+    action: newStatus,
+    user: userEmail,
+    date: new Date().toISOString(),
+    justification: justification
+  });
+
+  await updateDoc(reqRef, {
+    status: newStatus,
+    historicoAprovacao: JSON.stringify(history),
+    updatedAt: new Date().toISOString()
+  });
+
+  return true;
+}
+
+// ==========================================
+// REUNIÕES (MEETINGS)
+// ==========================================
+
+export async function fetchNextActiveMeeting(): Promise<any | null> {
+  const q = query(
+    collection(db, 'meetings'),
+    where('status', '==', 'Aberto'),
+    orderBy('dataReuniao', 'asc'),
+    limit(1)
+  );
+  const snapshot = await getDocs(q);
+  if (!snapshot.empty) {
+    return { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+  }
+  return null;
+}
+
+// ==========================================
+// MURAL
+// ==========================================
+
+export async function fetchMuralPosts(limitCount: number = 50): Promise<any[]> {
+  const q = query(
+    collection(db, 'mural_posts'),
+    orderBy('createdAt', 'desc'),
+    limit(limitCount)
+  );
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
+
+export async function createMuralPost(userId: string, nomeUsuario: string, conteudo: string) {
+  if (!conteudo.trim()) throw new Error('Conteúdo vazio');
+
+  const postData = {
+    userId,
+    nomeUsuario,
+    conteudo,
+    createdAt: new Date().toISOString()
+  };
+
+  const docRef = await addDoc(collection(db, 'mural_posts'), postData);
+  return { id: docRef.id, ...postData };
+}
+
+// ==========================================
+// PPGPsiu - QUALIS E DEFESA
+// ==========================================
+
+export async function getQualisFilterOptions() {
+  // Simulando a leitura do DB_Qualis - Em um DB real de Firestore isso seria 
+  // um doc de metadata ou se agruparia dinamicamente
+  return {
+    success: true,
+    areas: ["PSICOLOGIA", "INTERDISCIPLINAR", "SAÚDE COLETIVA", "EDUCAÇÃO"],
+    estratos: ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4", "C"],
+    eventos: ["2017-2020", "2013-2016"]
+  };
+}
+
+export async function searchQualisPeriodicos(filters: any) {
+  const params = new URLSearchParams();
+  if (filters.issn) params.append('issn', filters.issn);
+  if (filters.titulo) params.append('titulo', filters.titulo);
+
+  try {
+    const response = await fetch(`/api/qualis?${params.toString()}`);
+    const data = await response.json();
+
+    if (!data.success) {
+      throw new Error(data.message || 'Error searching Qualis database');
+    }
+
+    return data;
+  } catch (error) {
+    console.error('Error fetching Qualis:', error);
+    throw error;
+  }
+}
+
+export async function submitDefesa(data: any) {
+  // Create a pending request
+  return createNewRequest(data);
+}

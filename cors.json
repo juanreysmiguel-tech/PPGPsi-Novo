@@ -1,0 +1,323 @@
+<script>
+    /**
+     * ====================================================================
+     * COMPONENTS.HTML - Biblioteca de Componentes UI Reutilizáveis
+     * ====================================================================
+     * INSTRUÇÕES: Copie este arquivo inteiro para o Google Apps Script
+     * Arquivo > Novo > HTML > Nomeie como "components"
+     */
+
+    /* ===== CARD COMPONENT ===== */
+    const Card = {
+        render: function (opt) {
+            opt = opt || {};
+            const title = opt.title || '';
+            const content = opt.content || '';
+            const footer = opt.footer || null;
+            const color = opt.color || 'primary';
+            const icon = opt.icon || '';
+            const className = opt.className || '';
+            const textColor = (color === 'warning' || color === 'light') ? 'text-dark' : 'text-white';
+
+            return '<div class="card border-0 shadow-sm ' + className + '">' +
+                (title ? '<div class="card-header bg-' + color + ' ' + textColor + ' fw-bold d-flex align-items-center gap-2">' +
+                    (icon ? '<span class="fs-5">' + icon + '</span>' : '') + title + '</div>' : '') +
+                '<div class="card-body">' + content + '</div>' +
+                (footer ? '<div class="card-footer bg-transparent border-top">' + footer + '</div>' : '') +
+                '</div>';
+        },
+
+        renderStat: function (opt) {
+            opt = opt || {};
+            return '<div class="card border-0 shadow-sm h-100">' +
+                '<div class="card-body">' +
+                '<div class="d-flex justify-content-between align-items-start">' +
+                '<div>' +
+                '<div class="text-muted small text-uppercase mb-1">' + (opt.label || '') + '</div>' +
+                '<div class="fs-2 fw-bold text-' + (opt.color || 'primary') + '">' + (opt.value || '0') + '</div>' +
+                (opt.trend ? '<div class="small text-muted mt-1">' + opt.trend + '</div>' : '') +
+                '</div>' +
+                (opt.icon ? '<div class="fs-1 opacity-25">' + opt.icon + '</div>' : '') +
+                '</div></div></div>';
+        }
+    };
+
+    /* ===== MODAL COMPONENT ===== */
+    const Modal = {
+        open: function (opt) {
+            opt = opt || {};
+            const id = opt.id || 'dynamicModal';
+            const existing = document.getElementById(id);
+            if (existing) {
+                const instance = bootstrap.Modal.getInstance(existing);
+                if (instance) instance.dispose();
+                existing.remove();
+            }
+
+            const sizeClass = opt.size ? 'modal-' + opt.size : '';
+            const html = '<div class="modal fade" id="' + id + '" tabindex="-1">' +
+                '<div class="modal-dialog ' + sizeClass + '">' +
+                '<div class="modal-content border-0 shadow-lg">' +
+                '<div class="modal-header bg-primary text-white">' +
+                '<h5 class="modal-title">' + (opt.title || '') + '</h5>' +
+                '<button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>' +
+                '</div>' +
+                '<div class="modal-body p-4">' + (opt.body || '') + '</div>' +
+                (opt.footer ? '<div class="modal-footer bg-light">' + opt.footer + '</div>' : '') +
+                '</div></div></div>';
+
+            document.body.insertAdjacentHTML('beforeend', html);
+            const modalEl = document.getElementById(id);
+            const bsModal = new bootstrap.Modal(modalEl);
+            bsModal.show();
+
+            if (opt.onClose) {
+                modalEl.addEventListener('hidden.bs.modal', opt.onClose);
+            }
+            return bsModal;
+        },
+
+        close: function (id) {
+            id = id || 'dynamicModal';
+            const el = document.getElementById(id);
+            if (el) {
+                const bsModal = bootstrap.Modal.getInstance(el);
+                if (bsModal) bsModal.hide();
+            }
+        }
+    };
+
+    /* ===== STATUS BADGE COMPONENT ===== */
+    const StatusBadge = {
+        colorMap: {
+            'Aguardando Orientador': 'warning',
+            'Aguardando Avaliação do Orientador': 'warning',
+            'Pautado na CPG': 'info',
+            'Aprovado na CPG': 'success',
+            'Aprovado': 'success',
+            'Reprovado': 'danger',
+            'Reprovado na CPG': 'danger',
+            'Retornado para Ajustes': 'warning',
+            'Em Análise pela Comissão de Gestão (CG)': 'info',
+            'Aguardando Elucidação (Retornado para Ajustes)': 'warning',
+            'Aprovado pela CG (Aguardando Trâmite da Secretaria)': 'success',
+            'Em Pauta (Reunião do Colegiado)': 'primary',
+            'Prestação de Contas Solicitada': 'secondary',
+            'Prestação de Contas em Análise': 'info',
+            'Aguardando Depósito Financeiro': 'warning',
+            'Concluído / Arquivado': 'secondary',
+            'Indeferido / Recusado': 'danger',
+            'Excluído': 'dark',
+            'Dados Atualizados': 'info'
+        },
+
+        render: function (status, size) {
+            const color = this.colorMap[status] || 'secondary';
+            const sizeClass = size === 'sm' ? 'small' : (size === 'lg' ? 'fs-6' : '');
+            // Add text-dark for light-background badges
+            const textClass = (color === 'warning' || color === 'info' || color === 'light') ? 'text-dark' : '';
+            return '<span class="badge bg-' + color + ' ' + textClass + ' ' + sizeClass + ' px-3 py-2 rounded-pill">' + status + '</span>';
+        }
+    };
+
+    /* ===== TOAST NOTIFICATION COMPONENT ===== */
+    const Toast = {
+        container: null,
+
+        init: function () {
+            if (!this.container) {
+                this.container = document.createElement('div');
+                this.container.className = 'toast-container position-fixed top-0 end-0 p-3';
+                this.container.style.zIndex = '10000';
+                document.body.appendChild(this.container);
+            }
+        },
+
+        show: function (opt) {
+            this.init();
+            opt = opt || {};
+            const type = opt.type || 'info';
+            const duration = opt.duration || 5000;
+
+            const icons = { success: '✓', error: '✗', warning: '⚠', info: 'ℹ' };
+            const colors = { success: 'success', error: 'danger', warning: 'warning', info: 'info' };
+
+            const toastId = 'toast-' + Date.now();
+            const html = '<div id="' + toastId + '" class="toast align-items-center border-0 shadow-lg" role="alert">' +
+                '<div class="d-flex">' +
+                '<div class="toast-body d-flex align-items-center gap-3">' +
+                '<span class="fs-4 text-' + colors[type] + '">' + icons[type] + '</span>' +
+                '<div>' +
+                (opt.title ? '<div class="fw-bold">' + opt.title + '</div>' : '') +
+                '<div>' + (opt.message || '') + '</div>' +
+                '</div></div>' +
+                '<button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast"></button>' +
+                '</div></div>';
+
+            this.container.insertAdjacentHTML('beforeend', html);
+            const toastEl = document.getElementById(toastId);
+            const bsToast = new bootstrap.Toast(toastEl, { delay: duration });
+            bsToast.show();
+            toastEl.addEventListener('hidden.bs.toast', function () { toastEl.remove(); });
+        },
+
+        success: function (msg, title) { this.show({ type: 'success', message: msg, title: title }); },
+        error: function (msg, title) { this.show({ type: 'error', message: msg, title: title || 'Erro' }); },
+        warning: function (msg, title) { this.show({ type: 'warning', message: msg, title: title }); },
+        info: function (msg, title) { this.show({ type: 'info', message: msg, title: title }); }
+    };
+
+    /* ===== SKELETON LOADER COMPONENT ===== */
+    const Skeleton = {
+        renderCard: function (height) {
+            height = height || 180;
+            return '<div style="height:' + height + 'px;background:linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:12px;"></div>';
+        },
+
+        renderList: function (count) {
+            count = count || 3;
+            var html = '<div class="skeleton-list">';
+            for (var i = 0; i < count; i++) {
+                html += '<div class="mb-3 p-3 border rounded" style="background:linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;height:80px;"></div>';
+            }
+            return html + '</div>';
+        },
+
+        renderText: function (width) {
+            width = width || '100%';
+            return '<div style="height:1em;width:' + width + ';background:linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:4px;margin-bottom:0.5em;"></div>';
+        }
+    };
+
+    /* ===== EMPTY STATE COMPONENT ===== */
+    const EmptyState = {
+        render: function (opt) {
+            opt = opt || {};
+            var html = '<div class="empty-state text-center py-5">' +
+                '<div class="fs-1 mb-3">' + (opt.icon || '📭') + '</div>' +
+                '<h5 class="text-muted mb-2">' + (opt.title || 'Nenhum item encontrado') + '</h5>';
+            if (opt.message) html += '<p class="text-muted">' + opt.message + '</p>';
+            if (opt.actionText && opt.actionHandler) {
+                html += '<button class="btn btn-primary mt-3" onclick="' + opt.actionHandler + '">' + opt.actionText + '</button>';
+            }
+            return html + '</div>';
+        }
+    };
+
+    /* ===== PROGRESS STEPPER COMPONENT ===== */
+    const ProgressStepper = {
+        render: function (opt) {
+            opt = opt || {};
+            var steps = opt.steps || [];
+            var current = opt.currentStep || 0;
+
+            var html = '<div class="progress-stepper d-flex justify-content-between align-items-center mb-4">';
+            for (var i = 0; i < steps.length; i++) {
+                var isCompleted = i < current;
+                var isActive = i === current;
+                var bgColor = isCompleted ? 'bg-success' : (isActive ? 'bg-primary' : 'bg-secondary');
+                var textColor = isCompleted || isActive ? 'text-dark' : 'text-muted';
+
+                html += '<div class="step-item text-center flex-fill">' +
+                    '<div class="' + bgColor + ' text-white rounded-circle d-inline-flex align-items-center justify-content-center mb-2" style="width:36px;height:36px;font-weight:600;">' +
+                    (isCompleted ? '✓' : (i + 1)) + '</div>' +
+                    '<div class="small ' + textColor + ' fw-medium">' + steps[i] + '</div></div>';
+
+                if (i < steps.length - 1) {
+                    html += '<div class="flex-shrink-0 mx-2" style="height:2px;width:50px;background:' + (isCompleted ? '#10b981' : '#e5e7eb') + ';"></div>';
+                }
+            }
+            return html + '</div>';
+        }
+    };
+
+    /* ===== FORM FIELD COMPONENT ===== */
+    const FormField = {
+        render: function (opt) {
+            opt = opt || {};
+            var id = opt.id || Utils.generateId();
+            var name = opt.name || id;
+            var label = opt.label || '';
+            var type = opt.type || 'text';
+            var placeholder = opt.placeholder || '';
+            var required = opt.required || false;
+            var value = opt.value || '';
+            var helpText = opt.helpText || '';
+            var className = opt.className || '';
+
+            var requiredMark = required ? '<span class="text-danger">*</span>' : '';
+            var requiredAttr = required ? 'required' : '';
+            var fieldHtml = '';
+
+            if (type === 'select') {
+                fieldHtml = '<select class="form-select ' + className + '" id="' + id + '" name="' + name + '" ' + requiredAttr + '>' +
+                    '<option value="">Selecione...</option>';
+                var options = opt.options || [];
+                for (var i = 0; i < options.length; i++) {
+                    var selected = options[i].value === value ? 'selected' : '';
+                    fieldHtml += '<option value="' + options[i].value + '" ' + selected + '>' + options[i].label + '</option>';
+                }
+                fieldHtml += '</select>';
+            } else if (type === 'textarea') {
+                fieldHtml = '<textarea class="form-control ' + className + '" id="' + id + '" name="' + name + '" rows="' + (opt.rows || 3) + '" placeholder="' + placeholder + '" ' + requiredAttr + '>' + value + '</textarea>';
+            } else if (type === 'checkbox') {
+                return '<div class="form-check mb-3">' +
+                    '<input class="form-check-input" type="checkbox" id="' + id + '" name="' + name + '" ' + (value ? 'checked' : '') + ' ' + requiredAttr + '>' +
+                    '<label class="form-check-label" for="' + id + '">' + label + ' ' + requiredMark + '</label>' +
+                    (helpText ? '<div class="form-text">' + helpText + '</div>' : '') +
+                    '</div>';
+            } else {
+                fieldHtml = '<input type="' + type + '" class="form-control ' + className + '" id="' + id + '" name="' + name + '" placeholder="' + placeholder + '" value="' + value + '" ' + requiredAttr + '>';
+            }
+
+            return '<div class="mb-3">' +
+                '<label for="' + id + '" class="form-label fw-medium">' + label + ' ' + requiredMark + '</label>' +
+                fieldHtml +
+                (helpText ? '<div class="form-text">' + helpText + '</div>' : '') +
+                '</div>';
+        }
+    };
+
+    /* ===== LOADING OVERLAY COMPONENT ===== */
+    const LoadingOverlay = {
+        show: function (message) {
+            message = message || 'Carregando...';
+            var el = document.getElementById('loading-overlay');
+            if (el) {
+                el.style.display = 'flex';
+                var textEl = el.querySelector('.loading-text');
+                if (textEl) textEl.innerText = message;
+            }
+        },
+
+        hide: function () {
+            var el = document.getElementById('loading-overlay');
+            if (el) el.style.display = 'none';
+        }
+    };
+
+    /* ===== COMPONENTES EXPORTADOS ===== */
+    const Components = {
+        Card: Card,
+        Modal: Modal,
+        StatusBadge: StatusBadge,
+        Toast: Toast,
+        Skeleton: Skeleton,
+        EmptyState: EmptyState,
+        ProgressStepper: ProgressStepper,
+        FormField: FormField,
+        LoadingOverlay: LoadingOverlay
+    };
+
+    /* ===== INJETAR CSS PARA SKELETON ANIMATION ===== */
+    (function () {
+        if (!document.getElementById('components-styles')) {
+            var style = document.createElement('style');
+            style.id = 'components-styles';
+            style.innerHTML = '@keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }';
+            document.head.appendChild(style);
+        }
+    })();
+
+    console.log('✅ Components carregado com sucesso');
+</script>

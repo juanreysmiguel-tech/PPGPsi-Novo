@@ -1,0 +1,200 @@
+<script>
+    /**
+     * ====================================================================
+     * APP-STATE.HTML - Gerenciamento Global de Estado e Cache
+     * ====================================================================
+     * INSTRUÇÕES: Copie este arquivo inteiro para o Google Apps Script
+     * Arquivo > Novo > HTML > Nomeie como "app-state"
+     */
+
+    /* ===== GERENCIAMENTO DE ESTADO REATIVO ===== */
+    const AppState = {
+        data: {
+            user: null,
+            currentRole: null,
+            requests: [],
+            meetings: [],
+            users: [],
+            notifications: [],
+            loading: false,
+            currentView: 'home',
+            filters: {},
+            lastSync: null
+        },
+
+        subscribers: {},
+
+        set: function (key, value, silent) {
+            const oldValue = this.data[key];
+            this.data[key] = value;
+            if (!silent) this.notify(key, value, oldValue);
+        },
+
+        get: function (key) {
+            return this.data[key];
+        },
+
+        setMultiple: function (updates) {
+            Object.keys(updates).forEach(key => this.set(key, updates[key], true));
+            Object.keys(updates).forEach(key => this.notify(key, updates[key]));
+        },
+
+        subscribe: function (key, callback) {
+            if (!this.subscribers[key]) this.subscribers[key] = [];
+            this.subscribers[key].push(callback);
+            return () => {
+                const idx = this.subscribers[key].indexOf(callback);
+                if (idx > -1) this.subscribers[key].splice(idx, 1);
+            };
+        },
+
+        notify: function (key, newValue, oldValue) {
+            if (this.subscribers[key]) {
+                this.subscribers[key].forEach(cb => {
+                    try { cb(newValue, oldValue); } catch (e) { console.error('[AppState] Erro:', e); }
+                });
+            }
+        },
+
+        reset: function () {
+            this.data = {
+                user: null, currentRole: null, requests: [], meetings: [],
+                users: [], notifications: [], loading: false, currentView: 'home',
+                filters: {}, lastSync: null
+            };
+        }
+    };
+
+    /* ===== CACHE MANAGER COM TTL ===== */
+    const CacheManager = {
+        storage: {},
+        defaultTTL: 5 * 60 * 1000, // 5 minutos
+
+        set: function (key, data, ttl) {
+            this.storage[key] = {
+                data: data,
+                timestamp: Date.now(),
+                ttl: ttl || this.defaultTTL
+            };
+        },
+
+        get: function (key) {
+            const cached = this.storage[key];
+            if (!cached) return null;
+            if (Date.now() - cached.timestamp > cached.ttl) {
+                delete this.storage[key];
+                return null;
+            }
+            return cached.data;
+        },
+
+        invalidate: function (key) {
+            delete this.storage[key];
+        },
+
+        invalidateByPrefix: function (prefix) {
+            Object.keys(this.storage).forEach(key => {
+                if (key.startsWith(prefix)) delete this.storage[key];
+            });
+        },
+
+        clear: function () {
+            this.storage = {};
+        },
+
+        stats: function () {
+            const keys = Object.keys(this.storage);
+            return { total: keys.length, keys: keys };
+        }
+    };
+
+    /* ===== API MANAGER COM CACHE AUTOMÁTICO ===== */
+    const APIManager = {
+        call: function (funcName, args, options) {
+            args = args || [];
+            options = options || {};
+            const useCache = options.useCache !== false;
+            const cacheTTL = options.cacheTTL || 5 * 60 * 1000;
+            const cacheKey = options.cacheKey || 'api_' + funcName + '_' + JSON.stringify(args);
+
+            if (useCache) {
+                const cached = CacheManager.get(cacheKey);
+                if (cached !== null) return Promise.resolve(cached);
+            }
+
+            return new Promise((resolve, reject) => {
+                google.script.run
+                    .withSuccessHandler(function (data) {
+                        if (useCache) CacheManager.set(cacheKey, data, cacheTTL);
+                        resolve(data);
+                    })
+                    .withFailureHandler(function (error) {
+                        console.error('[API] Erro em ' + funcName + ':', error);
+                        reject(error);
+                    })
+                [funcName].apply(null, args);
+            });
+        },
+
+        invalidateCache: function (funcName) {
+            CacheManager.invalidateByPrefix('api_' + funcName + '_');
+        }
+    };
+
+    /* ===== UTILITÁRIOS ===== */
+    const Utils = {
+        debounce: function (func, delay) {
+            let timeout;
+            delay = delay || 300;
+            return function () {
+                const args = arguments;
+                const context = this;
+                clearTimeout(timeout);
+                timeout = setTimeout(function () { func.apply(context, args); }, delay);
+            };
+        },
+
+        throttle: function (func, limit) {
+            let inThrottle;
+            limit = limit || 1000;
+            return function () {
+                const args = arguments;
+                const context = this;
+                if (!inThrottle) {
+                    func.apply(context, args);
+                    inThrottle = true;
+                    setTimeout(function () { inThrottle = false; }, limit);
+                }
+            };
+        },
+
+        formatDate: function (date, format) {
+            if (!date) return '-';
+            format = format || 'dd/MM/yyyy';
+            const d = new Date(date);
+            if (isNaN(d)) return '-';
+            const day = String(d.getDate()).padStart(2, '0');
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const year = d.getFullYear();
+            return format.replace('dd', day).replace('MM', month).replace('yyyy', year);
+        },
+
+        formatCurrency: function (value) {
+            if (!value && value !== 0) return '-';
+            return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
+        },
+
+        truncate: function (text, maxLength) {
+            if (!text) return '';
+            maxLength = maxLength || 50;
+            if (text.length <= maxLength) return text;
+            return text.substring(0, maxLength) + '...';
+        },
+
+        generateId: function () {
+            return 'id_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        }
+    };
+
+    console.log('✅ App-State carregado com sucesso');
+</script>

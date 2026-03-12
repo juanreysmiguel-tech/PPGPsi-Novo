@@ -1,2 +1,5 @@
-# PPGPsi-Novo
-ae
+{
+  "name": "",
+  "description": "",
+  "requestFramePermissions": []
+}

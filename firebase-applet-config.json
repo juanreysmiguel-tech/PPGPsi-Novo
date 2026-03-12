@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <base target="_top">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PPGPsi - UFSCar</title>
+    <!-- Bootstrap 5 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <?!= include('css'); ?>
+
+    <style>
+        /* Integrated Kanban Styles */
+        .kanban-container {
+            display: flex;
+            gap: 1.5rem;
+            overflow-x: auto;
+            padding-bottom: 1.5rem;
+            min-height: 400px;
+        }
+
+        .kanban-column {
+            min-width: 320px;
+            background: #f8f9fa;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid #e9ecef;
+        }
+
+        .kanban-header {
+            padding: 1rem;
+            font-weight: 600;
+            border-bottom: 2px solid #e9ecef;
+            background: #fff;
+            border-radius: 12px 12px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .kanban-body {
+            padding: 1rem;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.8rem;
+        }
+
+        .kanban-card {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-left: 4px solid transparent;
+            border-radius: 8px;
+            padding: 1rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
+            transition: all 0.2s ease;
+        }
+
+        .kanban-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.06);
+        }
+
+        /* Status Colors */
+        .status-pendente {
+            border-left-color: #ffc107;
+        }
+
+        .status-aprovado {
+            border-left-color: #198754;
+        }
+
+        .status-rejeitado {
+            border-left-color: #dc3545;
+        }
+
+        .status-aguardando {
+            border-left-color: #0dcaf0;
+        }
+
+        .meeting-group {
+            margin-bottom: 2rem;
+        }
+
+        .meeting-title {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            color: #64748b;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        /* Request Stepper Styles */
+        .request-stepper {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            position: relative;
+        }
+
+        .request-stepper::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: #e9ecef;
+            transform: translateY(-50%);
+            z-index: 0;
+        }
+
+        .stepper-step {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            z-index: 1;
+            flex: 1;
+        }
+
+        .stepper-dot {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #e9ecef;
+            border: 2px solid #dee2e6;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.65rem;
+            color: #adb5bd;
+            margin-bottom: 4px;
+        }
+
+        .stepper-step.completed .stepper-dot {
+            background: #198754;
+            border-color: #198754;
+            color: white;
+        }
+
+        .stepper-step.current .stepper-dot {
+            background: #0d6efd;
+            border-color: #0d6efd;
+            color: white;
+            animation: pulse 1.5s infinite;
+        }
+
+        .stepper-step.rejected .stepper-dot {
+            background: #dc3545;
+            border-color: #dc3545;
+            color: white;
+        }
+
+        .stepper-label {
+            font-size: 0.55rem;
+            color: #6c757d;
+            text-align: center;
+            max-width: 50px;
+            line-height: 1.1;
+        }
+
+        .stepper-step.completed .stepper-label {
+            color: #198754;
+            font-weight: 600;
+        }
+
+        .stepper-step.current .stepper-label {
+            color: #0d6efd;
+            font-weight: 600;
+        }
+
+        .stepper-step.rejected .stepper-label {
+            color: #dc3545;
+            font-weight: 600;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                box-shadow: 0 0 0 0 rgba(13, 110, 253, 0.4);
+            }
+
+            50% {
+                box-shadow: 0 0 0 6px rgba(13, 110, 253, 0);
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="d-flex" id="wrapper">
+        <!-- Sidebar -->
+        <div id="sidebar-wrapper">
+            <div class="sidebar-heading fs-4 fw-bold p-3 text-center text-white">
+                <span class="d-block">PPGPsi</span>
+                <span class="fs-6 d-block fw-light" style="color: rgba(255,255,255,0.5)">Gestão CPG</span>
+            </div>
+
+            <div class="list-group list-group-flush">
+                <a href="#" onclick="event.preventDefault(); UI.renderView(); App.setActiveNav(this);"
+                    class="list-group-item sidebar-nav-item active">
+                    <span class="nav-icon">🏠</span> Início
+                </a>
+
+                <!-- Auth Menu (Hidden by default) -->
+                <div id="auth-menu" style="display:none">
+                    <div class="sidebar-section-title">Menu Principal</div>
+
+                    <!-- Mural da Comunidade (visible for all) -->
+                    <a href="#" onclick="event.preventDefault(); Views.renderMural(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-mural">
+                        <span class="nav-icon">📢</span> Mural da Comunidade
+                    </a>
+
+                    <a href="#" onclick="event.preventDefault(); Views.renderMeetingList(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item">
+                        <span class="nav-icon">🗓️</span> Reuniões CPG
+                    </a>
+
+                    <!-- Financial Dashboard (visible for Discente, Secretaria, Conselho) -->
+                    <a href="#"
+                        onclick="event.preventDefault(); Views.renderFinancialDashboard(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-financial" style="display:none">
+                        <span class="nav-icon">💰</span> Gestão Financeira
+                    </a>
+
+
+                    <!-- Pending Deposits (visible for Secretaria, Coordenação) -->
+                    <a href="#"
+                        onclick="event.preventDefault(); Views.renderPendingDepositsView(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-deposits" style="display:none">
+                        <span class="nav-icon">💸</span> Depósitos Pendentes
+                    </a>
+
+                    <!-- CG Parecer (visible for Conselho role) -->
+                    <a href="#" onclick="event.preventDefault(); Views.renderCGDashboard(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-cg-parecer" style="display:none">
+                        <span class="nav-icon">⚖️</span> Emitir Parecer
+                    </a>
+
+                    <!-- Gestão de Solicitações (visible for CG/Conselho roles) -->
+                    <a href="#"
+                        onclick="event.preventDefault(); Views.renderRequestManagement(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-request-management" style="display:none">
+                        <span class="nav-icon">📊</span> Gestão de Solicitações
+                    </a>
+
+                    <!-- Gestão de Solicitações (visible for Docente role) -->
+                    <a href="#"
+                        onclick="event.preventDefault(); Views.renderDocenteManagement(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-docente-mgmt" style="display:none">
+                        <span class="nav-icon">📁</span> Gestão de Solicitações
+                    </a>
+
+                    <!-- Recursos PROEX (visible for Docente role) -->
+                    <a href="#" onclick="event.preventDefault(); Views.renderProexDashboard(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-proex" style="display:none">
+                        <span class="nav-icon">💰</span> Solicitar Recursos PROEX
+                    </a>
+
+                    <!-- Consultar Periódicos (PPGPsiu) - Validação de Periódicos (visible for Discente and Docente) -->
+                    <a href="#" onclick="event.preventDefault(); Views.renderPPGPsiuView(); App.setActiveNav(this);"
+                        class="list-group-item list-group-item-action sidebar-nav-item border-0 py-3 text-muted fw-medium"
+                        id="nav-ppgpsiu" style="display: none;">
+                        <span class="nav-icon">📚</span> Consultar Periódicos
+                    </a>
+
+                    <!-- Crie seu PTT (visible for Discente and Docente) -->
+                    <a href="#" onclick="event.preventDefault(); Views.renderPTTView(); App.setActiveNav(this);"
+                        class="list-group-item list-group-item-action sidebar-nav-item border-0 py-3 text-muted fw-medium"
+                        id="nav-ptt" style="display: none;">
+                        <span class="nav-icon">📝</span> Crie seu PTT
+                    </a>
+
+                    <!-- Agendar Defesa (visible for Discente) -->
+                    <a href="#" onclick="event.preventDefault(); Views.renderDefesaView(); App.setActiveNav(this);"
+                        class="list-group-item list-group-item-action sidebar-nav-item border-0 py-3 text-muted fw-medium"
+                        id="nav-defesa" style="display: none;">
+                        <span class="nav-icon">🎓</span> Agendar Defesa
+                    </a>
+
+                    <a href="#"
+                        onclick="event.preventDefault(); Views.renderCalendarManagement(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-calendar" style="display:none">
+                        <span class="nav-icon">⚙️</span> Gestão Calendário
+                    </a>
+                    <a href="#" onclick="event.preventDefault(); Views.renderUserManagement(); App.setActiveNav(this);"
+                        class="list-group-item sidebar-nav-item" id="nav-users" style="display:none">
+                        <span class="nav-icon">👥</span> Gestão Usuários
+                    </a>
+                </div>
+            </div>
+
+            <!-- Sidebar Footer -->
+            <div class="sidebar-footer mt-auto text-white">
+                <div class="small mb-2" style="color: rgba(255,255,255,0.4)">Logado como:</div>
+                <div class="fw-bold text-truncate" id="user-name">Carregando...</div>
+                <div class="small text-truncate mb-3" id="user-email" style="color: rgba(255,255,255,0.5)">...</div>
+                <a href="#"
+                    onclick="event.preventDefault(); google.script.run.withSuccessHandler(function(url){window.top.location.href=url}).getScriptUrl()"
+                    class="btn btn-outline-danger btn-sm w-100">
+                    <span class="me-1">🚪</span> Sair
+                </a>
+            </div>
+        </div>
+
+        <!-- Page Content -->
+        <div id="page-content-wrapper" class="w-100 d-flex flex-column h-100">
+            <!-- Top Navbar -->
+            <nav class="navbar navbar-expand-lg navbar-dark border-bottom px-4 py-3 shadow-sm"
+                style="background-color: #1a237e !important;">
+                <button class="btn btn-outline-light me-3" id="menu-toggle">☰</button>
+
+                <h5 class="m-0 text-white fw-bold">Sistema de Solicitações</h5>
+
+                <div class="ms-auto d-flex align-items-center gap-3">
+                    <!-- Role Switcher -->
+                    <div class="dropdown" id="role-switcher-container" style="display:none">
+                        <button class="btn btn-outline-light dropdown-toggle btn-sm" type="button"
+                            data-bs-toggle="dropdown">
+                            Trocar Perfil
+                        </button>
+                        <ul class="dropdown-menu dropdown-menu-end shadow" id="role-selector">
+                            <!-- Populated by JS -->
+                        </ul>
+                    </div>
+
+                    <span class="badge bg-primary px-3 py-2 rounded-pill shadow-sm"
+                        id="current-role-display">Visitante</span>
+                </div>
+            </nav>
+
+            <!-- Main Content Area -->
+            <div class="container-fluid p-4" id="main-content" style="flex:1; overflow-y:auto; background:#f4f6f9">
+                <!-- Content injected here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Edit Contact -->
+    <div class="modal fade" id="modalEditContact" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title">Editar Contatos</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <form id="form-contact">
+                        <div class="mb-3">
+                            <label class="form-label">Telefone</label>
+                            <input type="text" class="form-control" id="contact-telefone">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Celular</label>
+                            <input type="text" class="form-control" id="contact-celular">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Endereço</label>
+                            <textarea class="form-control" id="contact-endereco" rows="2"></textarea>
+                        </div>
+                        <hr>
+                        <h6 class="text-muted">Contato de Emergência</h6>
+                        <div class="mb-3">
+                            <label class="form-label">Nome</label>
+                            <input type="text" class="form-control" id="contact-emergencia-nome">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Telefone</label>
+                            <input type="text" class="form-control" id="contact-emergencia-tel">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-link text-secondary text-decoration-none"
+                        data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-primary px-4" onclick="Forms.submitContactUpdate()">Salvar
+                        Alterações</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay">
+        <div class="text-center">
+            <div class="spinner-border text-white" role="status"></div>
+            <div class="loading-text">Carregando...</div>
+        </div>
+    </div>
+
+    <!-- Modal: New Request (Global) -->
+    <div class="modal fade" id="modalRequest" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title">Nova Solicitação</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <!-- ProPGWeb Header (populated by JS for students) -->
+                    <div id="propg-header-container"></div>
+
+                    <form id="form-request">
+                        <div class="mb-4">
+                            <label class="form-label fw-bold">Tipo de Solicitação</label>
+                            <select class="form-select form-select-lg" id="req-type">
+                                <!-- Populated by JS -->
+                            </select>
+                        </div>
+                        <div id="dynamic-fields-msg" class="alert alert-info text-center">
+                            Selecione um tipo acima para preencher o formulário.
+                        </div>
+                        <div id="dynamic-fields-container"></div>
+                    </form>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-link text-secondary text-decoration-none"
+                        data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-primary px-4" onclick="Forms.submitRequest()">Enviar
+                        Solicitação</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- jsPDF for PDF Generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+
+    <!-- Bootstrap JS Bundle -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+    <!-- Módulos de Estado e Componentes -->
+    <?!= include('app-state'); ?>
+    <?!= include('components'); ?>
+
+    <!-- JS Principal -->
+    <?!= include('js'); ?>
+
+    <!-- Menu Toggle Script -->
+    <script>
+        var el = document.getElementById("wrapper");
+        var toggleButton = document.getElementById("menu-toggle");
+
+        toggleButton.onclick = function () {
+            el.classList.toggle("toggled");
+        };
+    </script>
+</body>
+
+</html>

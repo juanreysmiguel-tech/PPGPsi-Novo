@@ -1,0 +1,89 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && (
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles.hasAny(['Secretaria', 'Coordenação']) ||
+        (request.auth.token.email == "juan.reys.miguel@gmail.com" && request.auth.token.email_verified == true)
+      );
+    }
+    
+    function isCG() {
+      return isAuthenticated() && (
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles.hasAny(['CG', 'Conselho'])
+      );
+    }
+    
+    function isDocente() {
+      return isAuthenticated() && (
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles.hasAny(['Docente'])
+      );
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    
+    match /users/{userId} {
+      // Anyone authenticated can read basic user info (needed for names/roles)
+      allow read: if isAuthenticated();
+      
+      // Only admins can create users, or users can create their own basic profile (but not set themselves as admin)
+      allow create: if isAuthenticated() && (
+        isAdmin() || 
+        (isOwner(userId) && (!('roles' in request.resource.data) || request.resource.data.roles == ['Visitante']))
+      );
+      
+      // Users can update their own profile (except roles), admins can update anything
+      allow update: if isAuthenticated() && (
+        isAdmin() || 
+        (isOwner(userId) && request.resource.data.roles == resource.data.roles)
+      );
+      
+      allow delete: if isAdmin();
+    }
+    
+    match /requests/{requestId} {
+      // Users can read their own requests. Admins, CG, and Docentes can read all (Docentes might need to filter by advisor, but for now we allow read and filter in UI, or we can restrict).
+      // For simplicity in this prototype, authenticated users can read requests (we will rely on UI filtering, but ideally we'd restrict this more).
+      allow read: if isAuthenticated();
+      
+      // Any authenticated user can create a request, but they must be the owner
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      
+      // Users can update their own requests (e.g. edit), Admins/CG/Docentes can update status
+      allow update: if isAuthenticated() && (
+        isDocOwner() || isAdmin() || isCG() || isDocente()
+      );
+      
+      allow delete: if isAdmin() || isDocOwner();
+    }
+    
+    match /meetings/{meetingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+    
+    match /mural_posts/{postId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAdmin() || isDocOwner();
+    }
+  }
+}
